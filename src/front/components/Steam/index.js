@@ -1,7 +1,7 @@
 // src/front/components/Steam/index.js
 // Barrel export for all Steam components
 
-export { default as SteamManager } from '../SteamManager';
+export { default as SteamManager } from '../SteamManagerCORS';
 export { default as EnhancedSteamFeatures } from './EnhancedSteamFeatures';
 export { default as SteamComponents } from './SteamComponents';
 

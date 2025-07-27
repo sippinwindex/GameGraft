@@ -5,7 +5,7 @@ import Avatar from './Avatar';
 import authService from '../store/authService';
 import useGlobalReducer from '../hooks/useGlobalReducer';
 import { ACTION_TYPES } from '../store/store.js';
-import { SteamManagerCORS } from './SteamManagerCORS';
+import { SteamManager } from './SteamManager';
 import EnhancedSteamFeatures from './Steam/EnhancedSteamFeatures';
 
 import { 
@@ -532,7 +532,7 @@ const GroupMembersTab = ({ group, user, onGroupUpdate }) => {
                                             {/* Steam Status Component */}
                                             {member.steam_connected && (
                                                 <div className="hidden sm:block">
-                                                    <SteamManagerCORS 
+                                                    <SteamManager 
                                                         variant="status-only" 
                                                         user={member}
                                                         className="text-xs"

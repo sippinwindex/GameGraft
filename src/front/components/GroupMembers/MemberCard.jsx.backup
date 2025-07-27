@@ -3,7 +3,7 @@
 
 import React from 'react';
 import Avatar from '../Avatar';
-import { SteamManagerCORS } from '../SteamManagerCORS';
+import { SteamManager } from '../SteamManager';
 
 const MemberCard = ({ 
     member, 
@@ -114,7 +114,7 @@ const MemberCard = ({
                     {/* Steam Status Component */}
                     {member.steam_connected && (
                         <div className="hidden sm:block">
-                            <SteamManagerCORS 
+                            <SteamManager 
                                 variant="status-only" 
                                 user={member}
                                 className="text-xs"
