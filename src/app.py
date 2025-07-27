@@ -129,13 +129,21 @@ def create_app():
     frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
     
     # FIXED: More permissive CORS for Flask-Admin
+    frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+    backend_url = os.getenv('VITE_BACKEND_URL', 'http://localhost:3001') # Assuming VITE_BACKEND_URL is set for frontend to know backend
+    
+    allowed_origins = [
+        frontend_url,
+        backend_url,
+        'http://localhost:3000',
+        'http://localhost:3001',
+        # Add any other specific origins if necessary, e.g., for admin panel
+        'https://bookish-funicular-9754qgjjg9743pqr7-3000.app.github.dev', # Example Codespace frontend
+        'https://bookish-funicular-9754qgjjg9743pqr7-3001.app.github.dev', # Example Codespace backend
+    ]
+    
     CORS(app, 
-        origins=[
-            'https://bookish-funicular-9754qgjjg9743pqr7-3000.app.github.dev',
-            'https://bookish-funicular-9754qgjjg9743pqr7-3001.app.github.dev',
-            'http://localhost:3000',
-            'http://localhost:3001'
-        ],
+        origins=allowed_origins,
         supports_credentials=True,
         allow_headers=['Content-Type', 'Authorization'],
         methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])

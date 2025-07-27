@@ -230,6 +230,7 @@ def register():
         return jsonify({"success": False, "error": "Internal server error"}), 500
 
 @auth.route('/login', methods=['POST'])
+@cross_origin()
 @handle_jwt_exceptions
 def login():
     """Enhanced login endpoint with comprehensive JWT error handling"""

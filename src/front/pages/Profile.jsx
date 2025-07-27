@@ -13,7 +13,7 @@ import { NetworkErrorState } from '../components/ErrorState';
 // 🎯 NEW: Import extracted components
 import ProfileDisplay from '../components/ProfileDisplay';
 import ProfileEditForm from '../components/ProfileEditForm';
-import SteamManager from '../components/SteamManager';
+import { SteamManager } from '../components/SteamManager';
 
 // 🐛 DEBUG: Debug component moved outside main component
 const DebugAuth = () => {

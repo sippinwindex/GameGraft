@@ -3,7 +3,7 @@
 
 import React from 'react';
 import Avatar from '../Avatar';
-import SteamManager from '../SteamManager';
+import { SteamManager } from '../SteamManager';
 
 const MemberCard = ({ 
     member, 

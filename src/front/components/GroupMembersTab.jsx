@@ -5,7 +5,7 @@ import Avatar from './Avatar';
 import authService from '../store/authService';
 import useGlobalReducer from '../hooks/useGlobalReducer';
 import { ACTION_TYPES } from '../store/store.js';
-import SteamManager from './SteamManager';
+import { SteamManager } from './SteamManager';
 import EnhancedSteamFeatures from './Steam/EnhancedSteamFeatures';
 
 import { 
