@@ -1,6 +1,7 @@
 # src/api/auth.py - FIXED VERSION with proper JWT error handling and refresh endpoint
 
 from flask import Blueprint, request, jsonify, current_app
+from flask_cors import cross_origin
 from api.models import db, User
 from api.utils import APIException, utc_now
 from flask_jwt_extended import (

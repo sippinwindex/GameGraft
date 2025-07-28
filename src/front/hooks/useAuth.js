@@ -153,16 +153,3 @@ export const usePermissions = () => {
  * MAINTAINED: For backward compatibility
  * ENHANCED: Now uses dedicated useConnectionStatus hook
  */
-export const useConnectionStatus = () => {
-    const connectionStatus = useConnectionStatus();
-    
-    return {
-        ...connectionStatus,
-        // Legacy property names for compatibility
-        isOnline: connectionStatus.isOnline,
-        apiReachable: connectionStatus.apiReachable,
-        lastCheck: connectionStatus.lastCheck
-    };
-};
-
-export default useAuth;

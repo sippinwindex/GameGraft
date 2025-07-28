@@ -1,4 +1,4 @@
-// src/front/hooks/useLiveVoting.js - PHASE 4 SSE INTEGRATION WITH YOUR EXISTING COMPONENTS
+// src/front/hooks/useLiveVoting.jsx - PHASE 4 SSE INTEGRATION WITH YOUR EXISTING COMPONENTS
 // 🚀 Works with your LiveVotingSession.jsx, VotingStatusPanel.jsx, and VotingReminders.jsx
 
 import { useEffect, useRef, useCallback } from 'react';
