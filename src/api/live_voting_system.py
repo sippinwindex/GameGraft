@@ -1,1253 +1,1182 @@
-# src/api/live_voting_system.py - ENHANCED VERSION with performance monitoring, conflict resolution and session persistence
+# src/api/steam.py - COMPLETE ENHANCED VERSION with SSE broadcasting and optimizations
 
-from flask import Blueprint, request, jsonify, Response, current_app
-from flask_jwt_extended import jwt_required, get_jwt_identity, decode_token
-from api.models import db, User, GamingGroup, GameSession, SteamGame, Vote, user_games
+from flask import Blueprint, request, jsonify, current_app
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from api.models import db, User, SteamGame, GameSession, GamingGroup
+from api.steam_service import steam_service
 from api.utils import APIException, utc_now
+from sqlalchemy import text
 
-# ADD THESE IMPORTS for performance monitoring
-from .performance_monitor import monitor, track_performance
-import time
+steam = Blueprint('steam', __name__)
 
-import json
-import threading
-import queue
-from datetime import datetime
-from collections import defaultdict
-from sqlalchemy import func
+def get_limiter():
+    """Get the limiter instance from the main app"""
+    return getattr(current_app, 'limiter', None)
 
-live_voting = Blueprint('live_voting', __name__)
+def get_live_voting_manager():
+    """Get the live voting manager for SSE broadcasting"""
+    try:
+        from .live_voting_system import live_voting_manager
+        return live_voting_manager
+    except ImportError:
+        current_app.logger.warning("Live voting manager not available for Steam SSE broadcasting")
+        return None
 
 # ============================================================================
-# CENTRALIZED SSE CONNECTION MANAGER WITH PERFORMANCE MONITORING
+# 🚀 NEW: ENHANCED HELPER FUNCTIONS FOR BATCH BROADCASTING
 # ============================================================================
 
-class LiveVotingManager:
-    """
-    Centralized manager for live voting sessions with SSE and performance monitoring
-    Handles the complete voting flow: lobby -> voting -> results
-    """
-    def __init__(self):
-        # Connection management
-        self.session_connections = defaultdict(dict)  # session_id -> {user_id: connection_queue}
-        self.connection_lock = threading.Lock()
-        
-        # Session state tracking
-        self.session_states = {}  # session_id -> current_state
-        self.session_data = {}    # session_id -> session_data_cache
-        
-        # Event history for reconnections (with cleanup)
-        self.event_history = defaultdict(list)  # session_id -> [events]
-        
-        # Add performance tracking initialization
-        print("🔥 LiveVotingManager initialized with performance monitoring")
+def broadcast_to_active_sessions(user_id, event_type, data, live_voting_manager=None):
+    """Helper function to broadcast Steam events to all active sessions for a user"""
+    if not live_voting_manager:
+        live_voting_manager = get_live_voting_manager()
     
-    def add_connection(self, session_id, user_id, connection_queue):
-        """Add a new SSE connection with performance tracking"""
-        # Track the SSE connection
-        monitor.track_sse_connection(session_id, user_id, 'connect')
-        
-        with self.connection_lock:
-            if session_id not in self.session_connections:
-                self.session_connections[session_id] = {}
-            
-            self.session_connections[session_id][user_id] = {
-                'queue': connection_queue,
-                'connected_at': time.time(),
-                'last_ping': time.time()
-            }
-            
-            # Send recent events to new connection
-            self._send_event_history(session_id, user_id)
-            
-            print(f"📡 User {user_id} connected to session {session_id}")
-            
-            # Broadcast user joined event (with performance tracking)
-            start_time = time.time()
-            self.broadcast_to_session(session_id, {
-                'type': 'user_connected',
-                'user_id': user_id,
-                'timestamp': utc_now().isoformat(),
-                'total_connections': len(self.session_connections[session_id])
-            }, exclude_user=user_id)
-            
-            processing_time = (time.time() - start_time) * 1000
-            monitor.track_sse_event('user_connected', processing_time)
+    if not live_voting_manager:
+        current_app.logger.debug(f"No live voting manager available for {event_type} broadcast")
+        return 0
     
-    def remove_connection(self, session_id, user_id):
-        """Remove SSE connection with performance tracking and cleanup"""
-        # Track the SSE disconnection
-        monitor.track_sse_connection(session_id, user_id, 'disconnect')
+    try:
+        # Get active sessions for user with optimized query
+        active_sessions = db.session.query(GameSession).join(GamingGroup).filter(
+            GamingGroup.members.any(id=user_id),
+            GameSession.status.in_(['planning', 'voting'])
+        ).all()
         
-        with self.connection_lock:
-            if session_id in self.session_connections:
-                self.session_connections[session_id].pop(user_id, None)
-                
-                if not self.session_connections[session_id]:
-                    # Clean up session data if no connections
-                    del self.session_connections[session_id]
-                    self.session_states.pop(session_id, None)
-                    self.session_data.pop(session_id, None)
-                    # Clean up old event history
-                    if session_id in self.event_history:
-                        del self.event_history[session_id]
+        if not active_sessions:
+            current_app.logger.debug(f"No active sessions found for user {user_id}")
+            return 0
+        
+        current_app.logger.info(f"Broadcasting {event_type} to {len(active_sessions)} active sessions for user {user_id}")
+        
+        # Broadcast to all sessions with specific event handling
+        successful_broadcasts = 0
+        for session in active_sessions:
+            try:
+                if event_type == 'sync_update':
+                    live_voting_manager.broadcast_steam_sync_update(session.id, data)
+                elif event_type == 'connection_change':
+                    live_voting_manager.broadcast_steam_connection_change(
+                        session.id, data, data.get('action', 'unknown')
+                    )
+                elif event_type == 'coverage_update':
+                    live_voting_manager._update_and_broadcast_steam_coverage(session.id)
+                elif event_type == 'sync_started':
+                    live_voting_manager.broadcast_to_session(session.id, {
+                        'type': 'steam_sync_started',
+                        'user_id': data['user_id'],
+                        'username': data['username'],
+                        'timestamp': utc_now().isoformat()
+                    })
+                elif event_type == 'sync_failed':
+                    live_voting_manager.broadcast_to_session(session.id, {
+                        'type': 'steam_sync_failed',
+                        'user_id': data['user_id'],
+                        'username': data['username'],
+                        'error': data.get('error', 'Unknown error'),
+                        'timestamp': utc_now().isoformat()
+                    })
                 else:
-                    # Broadcast user disconnected with performance tracking
-                    start_time = time.time()
-                    self.broadcast_to_session(session_id, {
-                        'type': 'user_disconnected',
-                        'user_id': user_id,
-                        'timestamp': utc_now().isoformat(),
-                        'total_connections': len(self.session_connections[session_id])
-                    })
-                    
-                    processing_time = (time.time() - start_time) * 1000
-                    monitor.track_sse_event('user_disconnected', processing_time)
+                    current_app.logger.warning(f"Unknown event type: {event_type}")
+                    continue
                 
-                print(f"📡 User {user_id} disconnected from session {session_id}")
-    
-    def broadcast_to_session(self, session_id, event_data, exclude_user=None):
-        """Broadcast event to all users in a session with performance tracking"""
-        start_time = time.time()
-        
-        with self.connection_lock:
-            if session_id in self.session_connections:
-                # Add to event history with cleanup
-                self._add_to_event_history(session_id, event_data)
+                successful_broadcasts += 1
+                current_app.logger.debug(f"Successfully broadcasted {event_type} to session {session.id}")
                 
-                dead_connections = []
-                
-                for user_id, connection_info in self.session_connections[session_id].items():
-                    if exclude_user and user_id == exclude_user:
-                        continue
-                        
-                    try:
-                        connection_queue = connection_info['queue']
-                        connection_queue.put_nowait(event_data)
-                        connection_info['last_ping'] = time.time()
-                        
-                    except queue.Full:
-                        dead_connections.append(user_id)
-                        monitor.track_error('sse_queue_full')
-                    except Exception as e:
-                        print(f"❌ Failed to send to user {user_id}: {e}")
-                        dead_connections.append(user_id)
-                        monitor.track_error('sse_send_error')
-                
-                # Clean up dead connections
-                for user_id in dead_connections:
-                    self.remove_connection(session_id, user_id)
-        
-        processing_time = (time.time() - start_time) * 1000
-        monitor.track_sse_event(event_data.get('type', 'broadcast'), processing_time)
-        
-        # Log performance for slow broadcasts
-        if processing_time > 100:
-            print(f"🐌 Slow broadcast detected: {processing_time:.2f}ms to {len(self.session_connections.get(session_id, {}))} users")
-    
-    def broadcast_vote_update(self, session_id, vote_data):
-        """Broadcast vote updates with detailed performance tracking"""
-        start_time = time.time()
-        
-        # Broadcast vote update
-        self.broadcast_to_session(session_id, {
-            'type': 'vote_update',
-            'vote_data': vote_data,
-            'timestamp': utc_now().isoformat()
-        })
-        
-        processing_time = (time.time() - start_time) * 1000
-        monitor.track_sse_event('vote_update', processing_time)
-        
-        # Track vote processing performance
-        if processing_time > 50:
-            print(f"⚡ Vote broadcast: {processing_time:.2f}ms")
-    
-    def broadcast_session_status(self, session_id, status):
-        """Broadcast session status changes with performance tracking"""
-        start_time = time.time()
-        
-        self.broadcast_to_session(session_id, {
-            'type': 'session_status',
-            'status': status,
-            'timestamp': utc_now().isoformat(),
-            'connected_users': len(self.session_connections.get(session_id, {}))
-        })
-        
-        processing_time = (time.time() - start_time) * 1000
-        monitor.track_sse_event('session_status', processing_time)
-    
-    def get_session_stats(self, session_id):
-        """Get session statistics with performance metrics"""
-        if session_id not in self.session_connections:
-            return None
-        
-        connected_users = self.session_connections[session_id]
-        current_time = time.time()
-        
-        return {
-            'session_id': session_id,
-            'total_users': len(connected_users),
-            'users': [
-                {
-                    'user_id': user_id,
-                    'connected_duration': current_time - info['connected_at'],
-                    'last_activity': current_time - info['last_ping']
-                }
-                for user_id, info in connected_users.items()
-            ],
-            'performance': {
-                'avg_connection_age': sum(
-                    current_time - info['connected_at'] 
-                    for info in connected_users.values()
-                ) / len(connected_users) if connected_users else 0
-            }
-        }
-    
-    def cleanup_stale_connections(self):
-        """Clean up stale connections with monitoring"""
-        current_time = time.time()
-        timeout = 300  # 5 minutes
-        cleaned_count = 0
-        
-        for session_id in list(self.session_connections.keys()):
-            if session_id not in self.session_connections:
-                continue
-                
-            stale_users = []
-            for user_id, connection_info in self.session_connections[session_id].items():
-                if current_time - connection_info['last_ping'] > timeout:
-                    stale_users.append(user_id)
-            
-            for user_id in stale_users:
-                print(f"🧹 Cleaning stale connection: {user_id} from session {session_id}")
-                self.remove_connection(session_id, user_id)
-                cleaned_count += 1
-        
-        if cleaned_count > 0:
-            print(f"🧹 Cleaned {cleaned_count} stale connections")
-            
-        return cleaned_count
-    
-    def _add_to_event_history(self, session_id, event_data):
-        """Add event to history with automatic cleanup"""
-        self.event_history[session_id].append({
-            **event_data,
-            'timestamp': utc_now().isoformat()
-        })
-        
-        # Keep only last 20 events to prevent memory leaks
-        if len(self.event_history[session_id]) > 20:
-            self.event_history[session_id] = self.event_history[session_id][-20:]
-    
-    def _send_event_history(self, session_id, user_id):
-        """Send recent events to reconnecting user"""
-        if session_id in self.event_history and user_id in self.session_connections[session_id]:
-            connection_info = self.session_connections[session_id][user_id]
-            connection_queue = connection_info['queue']
-            
-            # Send last 5 events only
-            recent_events = self.event_history[session_id][-5:]
-            for event in recent_events:
-                try:
-                    connection_queue.put_nowait({
-                        'type': 'history_event',
-                        'original_event': event
-                    })
-                except queue.Full:
-                    break
-    
-    def get_session_state(self, session_id):
-        """Get current session state"""
-        return self.session_states.get(session_id, 'unknown')
-    
-    def set_session_state(self, session_id, state):
-        """Set session state and broadcast change"""
-        old_state = self.session_states.get(session_id)
-        self.session_states[session_id] = state
-        
-        if old_state != state:
-            self.broadcast_to_session(session_id, {
-                'type': 'state_change',
-                'old_state': old_state,
-                'new_state': state,
-                'timestamp': utc_now().isoformat()
-            })
-
-# Global manager instance
-live_voting_manager = LiveVotingManager()
-
-# ============================================================================
-# 🔧 ENHANCED SSE CONNECTION ENDPOINT WITH PERFORMANCE MONITORING
-# ============================================================================
-
-@live_voting.route('/sessions/<int:session_id>/live-stream')
-def live_voting_stream(session_id):
-    """
-    🔧 ENHANCED: Main SSE endpoint with performance monitoring and session recovery support
-    """
-    # Track request start for performance monitoring
-    request_start = time.time()
-    
-    # Validate token from query params
-    token = request.args.get('token')
-    if not token:
-        return Response(
-            f"data: {json.dumps({'error': 'Authentication token required'})}\n\n",
-            mimetype='text/event-stream',
-            status=401
-        )
-    
-    try:
-        decoded_token = decode_token(token)
-        current_user_id = decoded_token['sub']
-        user = User.query.get(current_user_id)
-        
-        if not user:
-            return Response(
-                f"data: {json.dumps({'error': 'Invalid user'})}\n\n",
-                mimetype='text/event-stream',
-                status=401
-            )
-    except Exception:
-        return Response(
-            f"data: {json.dumps({'error': 'Invalid authentication token'})}\n\n",
-            mimetype='text/event-stream',
-            status=401
-        )
-    
-    # Validate session access
-    session = GameSession.query.get(session_id)
-    if not session:
-        return Response(
-            f"data: {json.dumps({'error': 'Session not found'})}\n\n",
-            mimetype='text/event-stream',
-            status=404
-        )
-    
-    if user not in session.group.members:
-        return Response(
-            f"data: {json.dumps({'error': 'Access denied'})}\n\n",
-            mimetype='text/event-stream',
-            status=403
-        )
-    
-    def generate_live_stream():
-        app = current_app._get_current_object()
-        connection_queue = queue.Queue(maxsize=50)
-        
-        with app.app_context():
-            try:
-                # Add connection to manager (performance tracking included in add_connection)
-                live_voting_manager.add_connection(session_id, current_user_id, connection_queue)
-                
-                # 🔧 NEW: Check for recoverable session state
-                try:
-#                    from api.session_persistence import SessionRecoveryMixin
-#                    recovery_mixin = SessionRecoveryMixin()
-                    recovery_result = recovery_mixin.restore_session_snapshot(session_id)
-                    
-                    if recovery_result and recovery_result['recovered']:
-                        # Send recovery notification
-                        yield f"data: {json.dumps({
-                            'type': 'session_recovery_available',
-                            'recovery_info': recovery_result,
-                            'message': 'Session state can be recovered from previous session'
-                        })}\n\n"
-                except ImportError:
-                    # Session persistence not available, continue normally
-                    pass
-                
-                # Send initial session state with performance tracking
-                start_time = time.time()
-                initial_state = get_complete_session_state(session_id, current_user_id)
-                yield f"data: {json.dumps(initial_state)}\n\n"
-                
-                processing_time = (time.time() - start_time) * 1000
-                monitor.track_sse_event('session_state', processing_time)
-                
-                # 🔧 NEW: Save connection state if session persistence available
-                try:
-#                    from api.session_persistence import SessionRecoveryMixin
-#                    recovery_mixin = SessionRecoveryMixin()
-                    recovery_mixin.save_session_snapshot(session_id, {
-                        'event': 'user_connected',
-                        'user_id': current_user_id,
-                        'connected_users': list(live_voting_manager.session_connections.get(session_id, {}).keys())
-                    })
-                except ImportError:
-                    pass
-                
-                # Main event loop with performance monitoring
-                while True:
-                    try:
-                        event = connection_queue.get(timeout=30)
-                        yield f"data: {json.dumps(event)}\n\n"
-                        
-                    except queue.Empty:
-                        # Send heartbeat with performance tracking
-                        heartbeat_time = time.time()
-                        yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': heartbeat_time})}\n\n"
-                        
-                        # Check if session is still active
-                        db.session.expire_all()
-                        current_session = GameSession.query.get(session_id)
-                        if not current_session or current_session.status == 'completed':
-                            break
-                    
-            except GeneratorExit:
-                pass
             except Exception as e:
-                current_app.logger.error(f"Live voting stream error: {e}")
-                monitor.track_error('sse_stream_error')
-                yield f"data: {json.dumps({'error': f'Stream error: {str(e)}'})}\n\n"
-            finally:
-                # Clean up connection and track performance
-                live_voting_manager.remove_connection(session_id, current_user_id)
-                request_time = (time.time() - request_start) * 1000
-                monitor.track_request(request_time)
-                print(f"📡 SSE stream ended for user {current_user_id} (Duration: {request_time:.2f}ms)")
-    
-    return Response(
-        generate_live_stream(),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Authorization',
-            'X-Accel-Buffering': 'no'
-        }
-    )
-
-# ============================================================================
-# PERFORMANCE-TRACKED DATABASE FUNCTIONS
-# ============================================================================
-
-@track_performance('database')
-def get_complete_session_state(session_id, user_id):
-    """Get complete session state for a user with performance tracking"""
-    try:
-        session = GameSession.query.get(session_id)
-        if not session:
-            return {'error': 'Session not found'}
+                current_app.logger.warning(f"Failed to broadcast {event_type} to session {session.id}: {e}")
         
-        # Base session info
-        session_data = {
-            'type': 'session_state',
-            'session': session.serialize(),
-            'user_id': user_id,
-            'timestamp': utc_now().isoformat()
-        }
-        
-        # Add state-specific data based on session status
-        if session.status == 'planning' or session.status == 'lobby':
-            session_data.update(get_lobby_state(session_id, user_id))
-        elif session.status == 'voting':
-            session_data.update(get_voting_state(session_id, user_id))
-        elif session.status == 'completed':
-            session_data.update(get_results_state(session_id, user_id))
-        
-        return session_data
+        current_app.logger.info(f"Completed {event_type} broadcast: {successful_broadcasts}/{len(active_sessions)} successful")
+        return successful_broadcasts
         
     except Exception as e:
-        current_app.logger.error(f"Error getting session state: {e}")
-        return {'error': f'Failed to get session state: {str(e)}'}
+        current_app.logger.error(f"Error broadcasting {event_type} for user {user_id}: {e}")
+        return 0
 
-@track_performance('database')
-def get_lobby_state(session_id, user_id):
-    """Get lobby state: common games, members waiting with performance tracking"""
+def get_user_active_sessions_info(user_id):
+    """Get detailed info about user's active sessions for debugging and status"""
     try:
-        session = GameSession.query.get(session_id)
-        group = session.group
+        active_sessions = db.session.query(GameSession).join(GamingGroup).filter(
+            GamingGroup.members.any(id=user_id),
+            GameSession.status.in_(['planning', 'voting'])
+        ).all()
         
-        # Get common games from Steam libraries
-        common_games = get_group_common_games(group.id)
-        
-        # Get group members
-        members = []
-        for member in group.members:
-            member_data = {
-                'id': member.id,
-                'username': member.username,
-                'avatar_url': member.avatar_url or member.steam_avatar_url,
-                'steam_connected': member.steam_connected or member.is_steam_connected,
-                'is_ready': True,  # In lobby, everyone is "ready"
-                'total_games': member.total_games or 0
-            }
-            members.append(member_data)
-        
-        return {
-            'state': 'lobby',
-            'common_games': common_games,
-            'members': members,
-            'total_common_games': len(common_games),
-            'steam_connected_members': len([m for m in members if m['steam_connected']]),
-            'can_start_voting': len(common_games) > 0 and len([m for m in members if m['steam_connected']]) >= 2
-        }
-        
-    except Exception as e:
-        current_app.logger.error(f"Error getting lobby state: {e}")
-        return {'state': 'lobby', 'error': str(e)}
-
-@track_performance('database')
-def get_voting_state(session_id, user_id):
-    """Get voting state: who voted, who's pending, current results with performance tracking"""
-    try:
-        session = GameSession.query.get(session_id)
-        group = session.group
-        
-        # Get votable games
-        votable_games = []
-        if hasattr(session, 'votable_games') and session.votable_games:
-            try:
-                votable_games = json.loads(session.votable_games)
-            except:
-                votable_games = get_group_common_games(group.id)
-        else:
-            votable_games = get_group_common_games(group.id)
-        
-        # Get voting status for each member
-        voted_user_ids = set()
-        votes = Vote.query.filter_by(session_id=session_id).all()
-        for vote in votes:
-            voted_user_ids.add(vote.user_id)
-        
-        members_status = []
-        for member in group.members:
-            has_voted = member.id in voted_user_ids
-            member_votes = []
-            
-            if has_voted:
-                user_votes = Vote.query.filter_by(
-                    session_id=session_id, 
-                    user_id=member.id
-                ).order_by(Vote.priority.desc()).all()
-                
-                for vote in user_votes:
-                    game = SteamGame.query.get(vote.game_id)
-                    if game:
-                        member_votes.append({
-                            'game': game.serialize(),
-                            'priority': vote.priority,
-                            'points': vote.priority
-                        })
-            
-            members_status.append({
-                'id': member.id,
-                'username': member.username,
-                'avatar_url': member.avatar_url or member.steam_avatar_url,
-                'has_voted': has_voted,
-                'vote_count': len(member_votes),
-                'votes': member_votes,
-                'status': 'voted' if has_voted else 'voting'
+        session_info = []
+        for session in active_sessions:
+            steam_members = [m for m in session.group.members if m.is_steam_connected]
+            session_info.append({
+                'id': session.id,
+                'session_name': session.session_name,
+                'status': session.status,
+                'group_id': session.group.id,
+                'group_name': session.group.name,
+                'total_members': len(session.group.members),
+                'steam_connected_members': len(steam_members),
+                'steam_coverage_percentage': (len(steam_members) / len(session.group.members) * 100) if session.group.members else 0,
+                'created_at': session.created_at.isoformat()
             })
         
-        # Get current user's vote status
-        user_has_voted = user_id in voted_user_ids
-        user_votes = []
-        if user_has_voted:
-            user_vote_objects = Vote.query.filter_by(
-                session_id=session_id, 
-                user_id=user_id
-            ).order_by(Vote.priority.desc()).all()
-            
-            for vote in user_vote_objects:
-                game = SteamGame.query.get(vote.game_id)
-                if game:
-                    user_votes.append({
-                        'game': game.serialize(),
-                        'priority': vote.priority,
-                        'points': vote.priority
-                    })
-        
-        # Calculate progress
-        total_members = len(group.members)
-        voted_count = len(voted_user_ids)
-        progress_percentage = (voted_count / total_members * 100) if total_members > 0 else 0
-        
-        # Check if voting should auto-complete
-        auto_complete_threshold = getattr(session, 'auto_complete_threshold', 0.8)
-        should_auto_complete = (
-            voted_count >= total_members * auto_complete_threshold and
-            voted_count >= 2
-        )
-        
-        return {
-            'state': 'voting',
-            'votable_games': votable_games,
-            'members_status': members_status,
-            'user_has_voted': user_has_voted,
-            'user_votes': user_votes,
-            'can_vote': not user_has_voted and session.status == 'voting',
-            'progress': {
-                'voted': voted_count,
-                'total': total_members,
-                'percentage': round(progress_percentage, 1)
-            },
-            'voting_settings': {
-                'max_choices': getattr(session, 'max_choices', 3),
-                'auto_complete_threshold': auto_complete_threshold,
-                'should_auto_complete': should_auto_complete
-            }
-        }
+        return session_info
         
     except Exception as e:
-        current_app.logger.error(f"Error getting voting state: {e}")
-        return {'state': 'voting', 'error': str(e)}
-
-@track_performance('database')
-def get_results_state(session_id, user_id):
-    """Get results state: final vote tallies, winner with performance tracking"""
-    try:
-        session = GameSession.query.get(session_id)
-        
-        # Get vote results using Vote model
-        results = Vote.get_session_results(session_id)
-        
-        # Get voting statistics
-        total_voters = Vote.get_voter_count(session_id)
-        total_members = len(session.group.members)
-        
-        # Get winner info
-        winner = results[0] if results else None
-        
-        return {
-            'state': 'results',
-            'results': results,
-            'winner': winner,
-            'statistics': {
-                'total_voters': total_voters,
-                'total_members': total_members,
-                'participation_rate': (total_voters / total_members * 100) if total_members > 0 else 0,
-                'total_votes_cast': sum(len(Vote.get_user_votes(session_id, member.id)) for member in session.group.members)
-            },
-            'session_completed_at': session.completed_at.isoformat() if hasattr(session, 'completed_at') and session.completed_at else None
-        }
-        
-    except Exception as e:
-        current_app.logger.error(f"Error getting results state: {e}")
-        return {'state': 'results', 'error': str(e)}
-
-@track_performance('database')
-def get_group_common_games(group_id):
-    """Get common multiplayer games for a group from synced Steam libraries with performance tracking"""
-    try:
-        group = GamingGroup.query.get(group_id)
-        if not group:
-            return []
-        
-        # Get Steam-connected members
-        steam_members = [m for m in group.members if (m.steam_connected or m.is_steam_connected) and m.steam_id]
-        
-        if len(steam_members) < 2:
-            return []
-        
-        # Use imported user_games table
-        user_ids = [m.id for m in steam_members]
-        
-        # Find games owned by ALL steam members
-        common_games_query = db.session.query(SteamGame).join(
-            user_games
-        ).filter(
-            user_games.c.user_id.in_(user_ids)
-        ).group_by(
-            SteamGame.id
-        ).having(
-            func.count(func.distinct(user_games.c.user_id)) == len(user_ids)
-        ).filter(
-            # Only multiplayer games
-            (SteamGame.multiplayer == True) | (SteamGame.co_op == True)
-        ).order_by(
-            SteamGame.name
-        ).limit(50)  # Limit to 50 games for performance
-        
-        common_games = []
-        for game in common_games_query:
-            game_data = game.serialize()
-            # Add ownership info
-            game_data['owned_by_all'] = True
-            game_data['owner_count'] = len(user_ids)
-            common_games.append(game_data)
-        
-        return common_games
-        
-    except Exception as e:
-        current_app.logger.error(f"Error getting common games: {e}")
+        current_app.logger.error(f"Error getting active sessions info for user {user_id}: {e}")
         return []
 
 # ============================================================================
-# VOTING FLOW CONTROL ENDPOINTS WITH PERFORMANCE MONITORING
+# 🔧 ENHANCED STEAM SYNC WITH COMPREHENSIVE SSE BROADCASTING
 # ============================================================================
 
-@live_voting.route('/sessions/<int:session_id>/start-voting', methods=['POST'])
+@steam.route('/sync-games', methods=['POST'])
 @jwt_required()
-@track_performance('database')
-def start_voting_phase(session_id):
-    """Start the voting phase for a session with performance tracking"""
-    try:
-        current_user_id = get_jwt_identity()
-        user = User.query.get(current_user_id)
-        
-        session = GameSession.query.get_or_404(session_id)
-        
-        # Check permissions (creator or admin)
-        if session.creator_id != current_user_id:
-            # Check if user is group creator
-            if session.group.creator_id != current_user_id:
-                return jsonify({'error': 'Only session or group creator can start voting'}), 403
-        
-        # Validate session can start voting
-        if session.status not in ['planning', 'lobby']:
-            return jsonify({'error': 'Session cannot start voting from current state'}), 400
-        
-        # Get common games
-        common_games = get_group_common_games(session.group.id)
-        if len(common_games) == 0:
-            return jsonify({'error': 'No common multiplayer games found'}), 400
-        
-        # Update session
-        session.status = 'voting'
-        session.updated_at = utc_now()
-        if hasattr(session, 'votable_games'):
-            session.votable_games = json.dumps(common_games)
-        
-        db.session.commit()
-        
-        # Broadcast state change with performance tracking
-        live_voting_manager.set_session_state(session_id, 'voting')
-        live_voting_manager.broadcast_to_session(session_id, {
-            'type': 'voting_started',
-            'started_by': user.username,
-            'votable_games': common_games,
-            'voting_settings': {
-                'max_choices': getattr(session, 'max_choices', 3),
-                'auto_complete_threshold': getattr(session, 'auto_complete_threshold', 0.8)
-            },
-            'timestamp': utc_now().isoformat()
-        })
-        
-        return jsonify({
-            'success': True,
-            'message': 'Voting started successfully',
-            'session_status': session.status,
-            'votable_games_count': len(common_games)
-        })
-        
-    except Exception as e:
-        current_app.logger.error(f"Error starting voting: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@live_voting.route('/sessions/<int:session_id>/submit-vote', methods=['POST'])
-@jwt_required()
-@track_performance('database')
-def submit_live_vote(session_id):
-    """
-    🔧 ENHANCED: Submit vote with performance monitoring, conflict resolution and session persistence
-    """
-    try:
-        current_user_id = get_jwt_identity()
-        user = User.query.get(current_user_id)
-        
-        session = GameSession.query.get_or_404(session_id)
-        
-        if session.status != 'voting':
-            return jsonify({'error': 'Voting is not active'}), 400
-        
-        if user not in session.group.members:
-            return jsonify({'error': 'Access denied'}), 403
-        
-        # 🔧 NEW: Check if user already voted using conflict resolver
-        try:
-#            from api.vote_conflict_resolution import vote_conflict_resolver
-            existing_vote = Vote.query.filter_by(session_id=session_id, user_id=current_user_id).first()
-            if existing_vote:
-                return jsonify({
-                    'error': 'You have already voted',
-                    'conflict_detected': True,
-                    'existing_votes': Vote.get_user_votes(session_id, current_user_id)
-                }), 409  # Conflict status code
-        except ImportError:
-            # Conflict resolution not available, use standard check
-            existing_vote = Vote.query.filter_by(session_id=session_id, user_id=current_user_id).first()
-            if existing_vote:
-                return jsonify({'error': 'You have already voted'}), 400
-        
-        data = request.get_json()
-        game_votes = data.get('game_votes', [])
-        
-        if not game_votes:
-            return jsonify({'error': 'No votes provided'}), 400
-        
-        # 🔧 NEW: Use conflict resolution for vote submission if available
-        try:
-#            from api.vote_conflict_resolution import vote_conflict_resolver
-#            vote_result = vote_conflict_resolver.submit_vote_with_conflict_resolution(
-#                session_id, current_user_id, game_votes
-#            )
-            # Mock vote result since Redis is disabled
-            vote_result = {"success": True, "message": "Vote submitted successfully"}
-            
-            if not vote_result['success']:
-                return jsonify({
-                    'error': vote_result['error'],
-                    'conflict_detected': vote_result.get('conflict_detected', False),
-                    'attempts_made': vote_result.get('attempts_made', 1),
-                    'error_type': vote_result.get('error_type')
-                }), 409
-            
-            votes_created = vote_result['votes_created']
-        except ImportError:
-            # Standard vote submission without conflict resolution
-            max_choices = getattr(session, 'max_choices', 3)
-            if len(game_votes) > max_choices:
-                return jsonify({'error': f'Maximum {max_choices} votes allowed'}), 400
-            
-            # Create votes in transaction
-            created_votes = []
-            for vote_data in game_votes:
-                vote = Vote(
-                    session_id=session_id,
-                    user_id=current_user_id,
-                    game_id=vote_data['game_id'],
-                    priority=vote_data['priority']
-                )
-                db.session.add(vote)
-                created_votes.append(vote)
-            
-            db.session.commit()
-            votes_created = len(created_votes)
-        
-        # 🔧 NEW: Save session state snapshot after vote
-        try:
-#            from api.session_persistence import SessionRecoveryMixin
-#            recovery_mixin = SessionRecoveryMixin()
-            recovery_mixin.save_session_snapshot(session_id, {
-                'event': 'vote_submitted',
-                'user_id': current_user_id,
-                'votes_created': votes_created
-            })
-        except ImportError:
-            pass
-        
-        # Check if voting should auto-complete
-        total_voters = Vote.get_voter_count(session_id)
-        total_members = len(session.group.members)
-        auto_complete_threshold = getattr(session, 'auto_complete_threshold', 0.8)
-        
-        should_complete = (
-            total_voters >= total_members * auto_complete_threshold and
-            total_voters >= 2
-        )
-        
-        if should_complete:
-            # Auto-complete session
-            session.status = 'completed'
-            session.completed_at = utc_now()
-            session.updated_at = utc_now()
-            
-            # Set winner
-            results = Vote.get_session_results(session_id)
-            if results and hasattr(session, 'winner_game_id'):
-                winner = results[0]
-                session.winner_game_id = winner['game']['id']
-                session.winner_votes = winner['vote_count']
-                session.winner_points = winner['total_points']
-            
-            db.session.commit()
-            
-            # 🔧 NEW: Save completion state
-            try:
-#                from api.session_persistence import SessionRecoveryMixin
-#                recovery_mixin = SessionRecoveryMixin()
-                recovery_mixin.save_session_snapshot(session_id, {
-                    'event': 'voting_completed',
-                    'auto_completed': True,
-                    'final_results': results
-                })
-            except ImportError:
-                pass
-            
-            # Broadcast completion with performance tracking
-            live_voting_manager.set_session_state(session_id, 'completed')
-            live_voting_manager.broadcast_to_session(session_id, {
-                'type': 'voting_completed',
-                'completed_by': 'auto_complete',
-                'final_results': results,
-                'winner': results[0] if results else None,
-                'timestamp': utc_now().isoformat()
-            })
-        else:
-            # Broadcast vote submitted with performance tracking
-            live_voting_manager.broadcast_vote_update(session_id, {
-                'user_id': current_user_id,
-                'username': user.username,
-                'vote_count': votes_created,
-                'progress': {
-                    'voted': total_voters,
-                    'total': total_members,
-                    'percentage': (total_voters / total_members * 100) if total_members > 0 else 0
-                }
-            })
-        
-        # Build response with conflict info if available
-        response_data = {
-            'success': True,
-            'message': 'Vote submitted successfully',
-            'votes_created': votes_created,
-            'session_status': session.status,
-            'voting_completed': session.status == 'completed'
-        }
-        
-        # Add conflict info if conflict resolution was used
-        try:
-#            from api.vote_conflict_resolution import vote_conflict_resolver
-            response_data['conflict_info'] = {
-                'had_conflicts': vote_result.get('had_conflicts', False),
-                'attempt_number': vote_result.get('attempt_number', 1)
-            }
-        except (ImportError, NameError):
-            pass
-        
-        return jsonify(response_data)
-        
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(f"Error submitting vote: {e}")
-        monitor.track_error('vote_submission_error')
-        return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
-
-# ============================================================================
-# PERFORMANCE MONITORING MIDDLEWARE (add this to your app.py)
-# ============================================================================
-
-def add_performance_middleware(app):
-    """Add performance monitoring middleware to Flask app"""
+def sync_games():
+    """🔧 ENHANCED: Sync user's Steam library with comprehensive SSE broadcasting"""
+    limiter = get_limiter()
+    if limiter:
+        # Rate limit sync to prevent spam - 5 syncs per minute
+        limiter.limit("5 per minute")(lambda: None)()
     
-    @app.before_request
-    def before_request():
-        request.start_time = time.time()
-    
-    @app.after_request  
-    def after_request(response):
-        if hasattr(request, 'start_time'):
-            request_time = (time.time() - request.start_time) * 1000
-            monitor.track_request(request_time)
-            
-            # Add performance headers
-            response.headers['X-Response-Time'] = f"{request_time:.2f}ms"
-            try:
-                current_metrics = monitor.get_current_metrics()
-                response.headers['X-Server-Health'] = current_metrics['health_status']['status']
-            except:
-                response.headers['X-Server-Health'] = 'unknown'
-        
-        return response
-    
-    @app.errorhandler(Exception)
-    def handle_error(e):
-        monitor.track_error(f"flask_error_{e.__class__.__name__}")
-        # Your existing error handling
-        return str(e), 500
-
-# ============================================================================
-# ADDITIONAL ENDPOINTS (remaining code unchanged but with performance tracking)
-# ============================================================================
-
-@live_voting.route('/sessions/<int:session_id>/complete-voting', methods=['POST'])
-@jwt_required()
-@track_performance('database')
-def complete_voting_phase(session_id):
-    """Manually complete voting phase with performance tracking"""
     try:
-        current_user_id = get_jwt_identity()
-        user = User.query.get(current_user_id)
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
         
-        session = GameSession.query.get_or_404(session_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
         
-        # Check permissions
-        if session.creator_id != current_user_id and session.group.creator_id != current_user_id:
-            return jsonify({'error': 'Only session or group creator can complete voting'}), 403
+        current_app.logger.info(f"Starting manual sync for user {user.username} (ID: {user_id})")
         
-        if session.status != 'voting':
-            return jsonify({'error': 'Session is not in voting state'}), 400
+        # Check sync permissions using User model helper methods
+        can_sync, message = user.can_sync_steam()
         
-        # Complete session
-        session.status = 'completed'
-        session.completed_at = utc_now()
-        session.updated_at = utc_now()
-        
-        # Set winner
-        results = Vote.get_session_results(session_id)
-        if results and hasattr(session, 'winner_game_id'):
-            winner = results[0]
-            session.winner_game_id = winner['game']['id']
-            session.winner_votes = winner['vote_count']
-            session.winner_points = winner['total_points']
-        
-        db.session.commit()
-        
-        # Broadcast completion with performance tracking
-        live_voting_manager.set_session_state(session_id, 'completed')
-        live_voting_manager.broadcast_to_session(session_id, {
-            'type': 'voting_completed',
-            'completed_by': user.username,
-            'final_results': results,
-            'winner': results[0] if results else None,
-            'timestamp': utc_now().isoformat()
-        })
-        
-        return jsonify({
-            'success': True,
-            'message': 'Voting completed successfully',
-            'final_results': results,
-            'winner': results[0] if results else None
-        })
-        
-    except Exception as e:
-        current_app.logger.error(f"Error completing voting: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-# ============================================================================
-# 🔧 NEW: ENHANCED ENDPOINTS FOR CONFLICT RESOLUTION AND SESSION RECOVERY
-# ============================================================================
-
-@live_voting.route('/sessions/<int:session_id>/recover', methods=['POST'])
-@jwt_required()
-@track_performance('database')
-def recover_session_state(session_id):
-    """
-    🔧 NEW: Recover session state after server restart or connection loss
-    """
-    try:
-        current_user_id = get_jwt_identity()
-        user = User.query.get(current_user_id)
-        
-        session = GameSession.query.get_or_404(session_id)
-        
-        if user not in session.group.members:
-            return jsonify({'error': 'Access denied'}), 403
-        
-        # Attempt session recovery
-        try:
-#            from api.session_persistence import SessionRecoveryMixin
-#            recovery_mixin = SessionRecoveryMixin()
-            recovery_result = recovery_mixin.restore_session_snapshot(session_id)
-            
-            if recovery_result and recovery_result['recovered']:
-                # Broadcast recovery to all users
-                live_voting_manager.broadcast_to_session(session_id, {
-                    'type': 'session_recovered',
-                    'recovered_data': recovery_result['snapshot_data'],
-                    'votes_count': recovery_result['votes_count'],
-                    'progress': recovery_result['progress'],
-                    'can_continue': recovery_result['can_continue'],
-                    'timestamp': utc_now().isoformat()
-                })
-                
+        if not can_sync:
+            if "not connected" in message:
                 return jsonify({
-                    'success': True,
-                    'message': 'Session state recovered',
-                    'recovery_info': recovery_result,
-                    'current_state': get_complete_session_state(session_id, current_user_id)
-                })
+                    'error': 'Steam not connected',
+                    'message': message
+                }), 400
             else:
+                # Rate limiting message with exact countdown
+                cooldown_remaining = user.steam_sync_cooldown_remaining()
                 return jsonify({
                     'success': False,
-                    'message': 'No recoverable session state found',
-                    'current_state': get_complete_session_state(session_id, current_user_id)
-                })
-        except ImportError:
-            return jsonify({
-                'success': False,
-                'message': 'Session persistence module not available',
-                'current_state': get_complete_session_state(session_id, current_user_id)
-            })
+                    'error': 'Recently synced',
+                    'message': message,
+                    'retry_after': cooldown_remaining,
+                    'last_synced': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None
+                }), 429
         
-    except Exception as e:
-        current_app.logger.error(f"Error recovering session: {e}")
-        monitor.track_error('session_recovery_error')
-        return jsonify({'error': 'Recovery failed', 'details': str(e)}), 500
-
-@live_voting.route('/sessions/<int:session_id>/conflicts', methods=['GET'])
-@jwt_required()
-@track_performance('database')
-def detect_session_conflicts(session_id):
-    """
-    🔧 NEW: Detect and analyze vote conflicts in a session
-    """
-    try:
-        current_user_id = get_jwt_identity()
-        session = GameSession.query.get_or_404(session_id)
+        # 🚀 ENHANCED: Broadcast sync started event
+        sync_started_data = {
+            'user_id': user_id,
+            'username': user.username,
+            'steam_username': user.steam_username
+        }
         
-        # Check if user is creator or group creator (admin only)
-        if session.creator_id != current_user_id and session.group.creator_id != current_user_id:
-            return jsonify({'error': 'Admin access required'}), 403
+        broadcasts_started = broadcast_to_active_sessions(user_id, 'sync_started', sync_started_data)
+        current_app.logger.info(f"Broadcasted sync start to {broadcasts_started} sessions")
         
+        # Use steam_service to sync
         try:
-#            from api.vote_conflict_resolution import vote_conflict_resolver
-#            conflict_analysis = vote_conflict_resolver.detect_vote_conflicts(session_id)
-#            conflict_stats = vote_conflict_resolver.get_conflict_statistics()
+            new_games, updated_games = steam_service.sync_user_library(user_id)
+            
+            # Update sync timestamp using User model method
+            user.update_steam_sync_time()
+            
+            # Update user's total games count
+            user.total_games = len(user.owned_games)
+            
+            # Commit the changes
+            db.session.commit()
+            
+            current_app.logger.info(f"Steam sync completed for {user.username}: {new_games} new, {updated_games} updated, total: {user.total_games}")
+            
+            # 🚀 ENHANCED: Comprehensive sync completion broadcasting
+            sync_completed_data = {
+                'user_id': user_id,
+                'username': user.username,
+                'total_games': user.total_games,
+                'sync_time': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None,
+                'steam_username': user.steam_username,
+                'new_games': new_games,
+                'updated_games': updated_games,
+                'new_games_added': new_games,  # For frontend compatibility
+                'synced_at': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None
+            }
+            
+            broadcasts_completed = broadcast_to_active_sessions(user_id, 'sync_update', sync_completed_data)
+            
+            # Also update Steam coverage for all affected sessions
+            coverage_broadcasts = broadcast_to_active_sessions(user_id, 'coverage_update', {})
+            
+            current_app.logger.info(f"Broadcasted sync completion to {broadcasts_completed} sessions, coverage updates to {coverage_broadcasts} sessions")
             
             return jsonify({
                 'success': True,
-                'session_id': session_id,
-                'conflict_analysis': conflict_analysis,
-                'system_stats': conflict_stats,
-                'recommendations': _generate_conflict_recommendations(conflict_analysis)
-            })
-        except ImportError:
+                'message': f'Library synced successfully! Added {new_games} new games, updated {updated_games} games.',
+                'new_games': new_games,
+                'updated_games': updated_games,
+                'total_games': user.total_games,
+                'sync_time': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None,
+                'broadcasting': {
+                    'sync_started_notifications': broadcasts_started,
+                    'sync_completed_notifications': broadcasts_completed,
+                    'coverage_update_notifications': coverage_broadcasts
+                }
+            }), 200
+            
+        except Exception as sync_error:
+            db.session.rollback()
+            current_app.logger.error(f"Steam service sync failed for {user.username}: {str(sync_error)}")
+            
+            # 🚀 ENHANCED: Broadcast sync failure
+            sync_failed_data = {
+                'user_id': user_id,
+                'username': user.username,
+                'error': str(sync_error)
+            }
+            
+            broadcasts_failed = broadcast_to_active_sessions(user_id, 'sync_failed', sync_failed_data)
+            current_app.logger.info(f"Broadcasted sync failure to {broadcasts_failed} sessions")
+            
             return jsonify({
                 'success': False,
-                'message': 'Conflict resolution module not available'
-            })
+                'error': 'Sync failed',
+                'message': 'Failed to sync Steam library. Please try again later.',
+                'broadcasting': {
+                    'failure_notifications': broadcasts_failed
+                }
+            }), 500
         
+    except APIException as e:
+        current_app.logger.error(f"API Exception in sync_games: {e.message}")
+        return jsonify({'success': False, 'error': e.message}), e.status_code
     except Exception as e:
-        current_app.logger.error(f"Error detecting conflicts: {e}")
-        monitor.track_error('conflict_detection_error')
-        return jsonify({'error': 'Conflict detection failed', 'details': str(e)}), 500
-
-def _generate_conflict_recommendations(conflict_analysis):
-    """Generate recommendations based on conflict analysis"""
-    recommendations = []
-    
-    if not conflict_analysis['conflicts']:
-        recommendations.append("✅ No conflicts detected - session is healthy")
-        return recommendations
-    
-    for conflict in conflict_analysis['conflicts']:
-        if conflict['type'] == 'excess_votes':
-            recommendations.append(f"⚠️ User {conflict['user_id']} has {conflict['vote_count']} votes (should be ≤3)")
-        elif conflict['type'] == 'duplicate_game_vote':
-            recommendations.append(f"🔁 User {conflict['user_id']} voted multiple times for game {conflict['game_id']}")
-    
-    recommendations.append("💡 Consider clearing invalid votes and allowing re-submission")
-    return recommendations
-
-# ============================================================================
-# SESSION STATE ENDPOINTS WITH PERFORMANCE TRACKING
-# ============================================================================
-
-@live_voting.route('/sessions/<int:session_id>/state', methods=['GET'])
-@jwt_required()
-@track_performance('database')
-def get_session_state_endpoint(session_id):
-    """Get current session state (for polling fallback)"""
-    try:
-        current_user_id = get_jwt_identity()
-        user = User.query.get(current_user_id)
-        
-        session = GameSession.query.get_or_404(session_id)
-        
-        if user not in session.group.members:
-            return jsonify({'error': 'Access denied'}), 403
-        
-        state_data = get_complete_session_state(session_id, current_user_id)
-        
+        current_app.logger.error(f"Error in sync_games: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
-            'success': True,
-            **state_data
-        })
-        
-    except Exception as e:
-        current_app.logger.error(f"Error getting session state: {e}")
-        monitor.track_error('session_state_error')
-        return jsonify({'error': 'Internal server error'}), 500
+            'success': False,
+            'error': 'Internal server error',
+            'message': 'Failed to sync Steam library. Please try again later.'
+        }), 500
 
-@live_voting.route('/sessions/<int:session_id>/connections', methods=['GET'])
+# ============================================================================
+# 🚀 NEW: ENHANCED STEAM CONNECTION MANAGEMENT WITH SSE
+# ============================================================================
+
+@steam.route('/connect', methods=['POST'])
 @jwt_required()
-@track_performance('database')
-def get_session_connections(session_id):
-    """Get current SSE connections for debugging"""
+def connect_steam():
+    """🚀 NEW: Handle Steam connection with SSE broadcasting"""
     try:
-        current_user_id = get_jwt_identity()
-        session = GameSession.query.get_or_404(session_id)
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
         
-        # Check if user is creator or group creator
-        if session.creator_id != current_user_id and session.group.creator_id != current_user_id:
-            return jsonify({'error': 'Access denied'}), 403
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
         
-        with live_voting_manager.connection_lock:
-            connection_count = len(live_voting_manager.session_connections.get(session_id, {}))
-            connected_users = list(live_voting_manager.session_connections.get(session_id, {}).keys())
+        if user.is_steam_connected:
+            return jsonify({
+                'success': False,
+                'error': 'Steam already connected',
+                'message': 'Steam account is already connected'
+            }), 400
         
-        return jsonify({
-            'success': True,
-            'session_id': session_id,
-            'total_connections': connection_count,
-            'connected_user_ids': connected_users,
-            'session_state': live_voting_manager.get_session_state(session_id)
-        })
+        # Get connection data from request
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No connection data provided'}), 400
         
-    except Exception as e:
-        current_app.logger.error(f"Error getting connections: {e}")
-        monitor.track_error('connection_status_error')
-        return jsonify({'error': 'Internal server error'}), 500
-
-# ============================================================================
-# STEAM API PERFORMANCE TRACKING
-# ============================================================================
-
-@track_performance('steam_api')
-def fetch_steam_game_data(app_id):
-    """Fetch Steam game data with performance tracking"""
-    import requests
-    start_time = time.time()
-    
-    try:
-        response = requests.get(f"https://store.steampowered.com/api/appdetails?appids={app_id}")
-        response_time = (time.time() - start_time) * 1000
+        steam_id = data.get('steam_id')
+        steam_username = data.get('steam_username')
+        steam_avatar_url = data.get('steam_avatar_url')
+        steam_profile_url = data.get('steam_profile_url')
         
-        # Track the API call
-        monitor.track_steam_api_call(response_time, success=response.ok)
+        if not steam_id:
+            return jsonify({'error': 'Steam ID required'}), 400
         
-        if response.ok:
-            return response.json()
-        else:
-            monitor.track_error('steam_api_error')
-            return None
-            
-    except Exception as e:
-        response_time = (time.time() - start_time) * 1000
-        monitor.track_steam_api_call(response_time, success=False)
-        monitor.track_error('steam_api_exception')
-        raise e
-
-@track_performance('steam_api')  
-def fetch_steam_user_games(steam_id):
-    """Fetch Steam user games with performance tracking"""
-    import requests
-    start_time = time.time()
-    
-    try:
-        steam_api_key = current_app.config.get('STEAM_API_KEY')
-        if not steam_api_key:
-            monitor.track_error('steam_api_key_missing')
-            return []
-            
-        url = f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
-        params = {
-            'key': steam_api_key,
-            'steamid': steam_id,
-            'format': 'json',
-            'include_appinfo': 1
+        # Update user Steam connection
+        user.steam_id = steam_id
+        user.steam_username = steam_username
+        user.steam_avatar_url = steam_avatar_url
+        user.steam_profile_url = steam_profile_url
+        user.steam_connected = True
+        user.is_steam_connected = True
+        
+        db.session.commit()
+        
+        current_app.logger.info(f"Steam connected for user {user.username}: {steam_username}")
+        
+        # 🚀 ENHANCED: Broadcast connection to active sessions
+        connection_data = {
+            'user_id': user_id,
+            'username': user.username,
+            'steam_username': steam_username,
+            'steam_avatar_url': steam_avatar_url,
+            'action': 'connected'
         }
         
-        response = requests.get(url, params=params)
-        response_time = (time.time() - start_time) * 1000
+        broadcasts_sent = broadcast_to_active_sessions(user_id, 'connection_change', connection_data)
         
-        monitor.track_steam_api_call(response_time, success=response.ok)
+        # Also update Steam coverage for all affected sessions
+        coverage_broadcasts = broadcast_to_active_sessions(user_id, 'coverage_update', {})
         
-        if response.ok:
-            data = response.json()
-            return data.get('response', {}).get('games', [])
-        else:
-            monitor.track_error('steam_api_error')
-            return []
-            
+        return jsonify({
+            'success': True,
+            'message': 'Steam connected successfully',
+            'steam_info': {
+                'steam_id': steam_id,
+                'steam_username': steam_username,
+                'steam_avatar_url': steam_avatar_url
+            },
+            'broadcasting': {
+                'connection_notifications': broadcasts_sent,
+                'coverage_update_notifications': coverage_broadcasts
+            }
+        }), 200
+        
     except Exception as e:
-        response_time = (time.time() - start_time) * 1000
-        monitor.track_steam_api_call(response_time, success=False)
-        monitor.track_error('steam_user_games_error')
-        current_app.logger.error(f"Error fetching Steam user games: {e}")
-        return []
+        db.session.rollback()
+        current_app.logger.error(f"Error connecting Steam: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': 'Failed to connect Steam account. Please try again later.'
+        }), 500
+
+@steam.route('/disconnect', methods=['POST'])
+@jwt_required()
+def disconnect_steam():
+    """🔧 ENHANCED: Disconnect Steam account with comprehensive SSE broadcasting"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        if not user.is_steam_connected:
+            return jsonify({
+                'success': False,
+                'error': 'Steam not connected',
+                'message': 'Steam account is not currently connected'
+            }), 400
+        
+        # Store user data for broadcasting before disconnection
+        user_data = {
+            'user_id': user_id,
+            'username': user.username,
+            'steam_username': user.steam_username,
+            'steam_avatar_url': user.steam_avatar_url,
+            'action': 'disconnected'
+        }
+        
+        # Disconnect Steam
+        user.steam_id = None
+        user.steam_username = None
+        user.steam_avatar_url = None
+        user.steam_profile_url = None
+        user.steam_connected = False
+        user.is_steam_connected = False
+        user.steam_library_synced_at = None
+        user.total_games = 0
+        
+        # Clear user's game associations
+        user.owned_games.clear()
+        
+        db.session.commit()
+        
+        current_app.logger.info(f"Steam disconnected for user {user.username}")
+        
+        # 🚀 ENHANCED: Broadcast disconnection to active voting sessions
+        broadcasts_sent = broadcast_to_active_sessions(user_id, 'connection_change', user_data)
+        
+        # Also update Steam coverage for all affected sessions
+        coverage_broadcasts = broadcast_to_active_sessions(user_id, 'coverage_update', {})
+        
+        return jsonify({
+            'success': True,
+            'message': 'Steam account disconnected successfully',
+            'broadcasting': {
+                'disconnection_notifications': broadcasts_sent,
+                'coverage_update_notifications': coverage_broadcasts
+            }
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error disconnecting Steam: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': 'Failed to disconnect Steam account. Please try again later.'
+        }), 500
+
+# ============================================================================
+# EXISTING ENDPOINTS WITH ENHANCED ERROR HANDLING AND SSE AWARENESS
+# ============================================================================
+
+@steam.route('/owned-games', methods=['GET'])
+@jwt_required()
+def get_owned_games():
+    """Get user's owned Steam games with enhanced error handling"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+            
+        if not user.steam_id:
+            return jsonify({
+                'error': 'Steam not connected',
+                'message': 'Please connect your Steam account first to view your games',
+                'games': [],
+                'total': 0
+            }), 400
+        
+        current_app.logger.info(f"Loading games for user {user.username}")
+        
+        # Get games using raw SQL for reliability
+        result = db.session.execute(
+            text("""
+                SELECT sg.*, ug.hours_played, ug.last_played, ug.added_at
+                FROM steam_game sg
+                JOIN user_games ug ON sg.id = ug.game_id
+                WHERE ug.user_id = :user_id
+                ORDER BY sg.name
+            """),
+            {'user_id': user_id}
+        )
+        
+        games = []
+        for row in result:
+            game_data = {
+                'id': row.id,
+                'steam_appid': row.steam_appid,
+                'name': row.name,
+                'short_description': row.short_description,
+                'header_image': row.header_image,
+                'website': row.website,
+                'genres': row.genres,
+                'categories': row.categories,
+                'multiplayer': row.multiplayer,
+                'co_op': row.co_op,
+                'max_players': row.max_players,
+                'min_players': row.min_players,
+                'price': row.price,
+                'release_date': row.release_date.isoformat() if row.release_date else None,
+                'hours_played': row.hours_played or 0,
+                'playtime_forever': row.hours_played or 0,  # Steam API compatibility
+                'last_played': row.last_played.isoformat() if row.last_played else None,
+                'added_at': row.added_at.isoformat() if row.added_at else None
+            }
+            
+            # Parse JSON fields safely
+            try:
+                import json
+                game_data['genres'] = json.loads(row.genres) if row.genres else []
+                game_data['categories'] = json.loads(row.categories) if row.categories else []
+            except (json.JSONDecodeError, TypeError):
+                game_data['genres'] = []
+                game_data['categories'] = []
+            
+            games.append(game_data)
+        
+        current_app.logger.info(f"Loaded {len(games)} games for user {user.username}")
+        
+        return jsonify({
+            'success': True,
+            'games': games,
+            'total': len(games),
+            'steam_connected': user.is_steam_connected,
+            'steam_username': user.steam_username,
+            'last_synced': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error in get_owned_games: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': 'Failed to load game library. Please try again later.'
+        }), 500
+
+@steam.route('/sync-status', methods=['GET'])
+@jwt_required()
+def get_sync_status():
+    """Get user's Steam sync status with SSE integration info"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Use User model helper method
+        status = user.get_steam_sync_status()
+        
+        # 🚀 ENHANCED: Add comprehensive active sessions info
+        active_sessions_info = get_user_active_sessions_info(user_id)
+        
+        # SSE integration status
+        live_voting_manager = get_live_voting_manager()
+        sse_status = {
+            'available': live_voting_manager is not None,
+            'can_broadcast': live_voting_manager is not None and user.is_steam_connected,
+            'active_connections': 0
+        }
+        
+        if live_voting_manager:
+            total_connections = sum(
+                len(connections) 
+                for connections in live_voting_manager.session_connections.values()
+            )
+            sse_status['active_connections'] = total_connections
+        
+        status.update({
+            'active_sessions': active_sessions_info,
+            'active_sessions_count': len(active_sessions_info),
+            'sse_integration': sse_status,
+            'will_notify_sessions': len(active_sessions_info) > 0 and sse_status['available']
+        })
+        
+        return jsonify({
+            'success': True,
+            'status': status
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error getting sync status: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error'
+        }), 500
+
+@steam.route('/can-sync', methods=['GET'])
+@jwt_required()
+def can_sync():
+    """Check if user can sync Steam library with detailed status"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Use User model helper methods
+        can_sync, message = user.can_sync_steam()
+        cooldown_remaining = user.steam_sync_cooldown_remaining()
+        
+        return jsonify({
+            'success': True,
+            'can_sync': can_sync,
+            'message': message,
+            'cooldown_remaining': cooldown_remaining,
+            'last_synced': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None,
+            'steam_connected': user.is_steam_connected,
+            'total_games': user.total_games or 0
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error checking sync permission: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error'
+        }), 500
+
+@steam.route('/common-games', methods=['POST'])
+@jwt_required()
+def common_games():
+    """Get common games for user IDs with enhanced validation"""
+    try:
+        data = request.json
+        user_ids = data.get('user_ids', [])
+        
+        # Enhanced validation
+        if not isinstance(user_ids, list):
+            return jsonify({'error': 'user_ids must be a list'}), 400
+        
+        if len(user_ids) < 2:
+            return jsonify({'error': 'At least two user IDs required'}), 400
+        
+        if len(user_ids) > 50:  # Prevent excessive queries
+            return jsonify({'error': 'Too many user IDs (maximum 50)'}), 400
+        
+        # Validate that all user IDs are integers
+        try:
+            user_ids = [int(uid) for uid in user_ids]
+        except (ValueError, TypeError):
+            return jsonify({'error': 'All user IDs must be valid integers'}), 400
+        
+        # Validate that all users exist and have Steam connected
+        users = User.query.filter(User.id.in_(user_ids)).all()
+        if len(users) != len(user_ids):
+            return jsonify({'error': 'One or more users not found'}), 404
+        
+        steam_connected_users = [u for u in users if u.is_steam_connected]
+        if len(steam_connected_users) < 2:
+            return jsonify({
+                'error': 'At least two users must have Steam connected',
+                'steam_connected_count': len(steam_connected_users),
+                'total_users': len(users)
+            }), 400
+        
+        current_app.logger.info(f"Finding common games for {len(steam_connected_users)} Steam-connected users")
+        
+        # Use steam_service to find common games
+        games = steam_service.find_common_games(user_ids)
+        
+        return jsonify({
+            'success': True,
+            'games': games,
+            'total_users': len(user_ids),
+            'steam_connected_users': len(steam_connected_users),
+            'common_games_count': len([g for g in games if g.get('is_common', False)]),
+            'metadata': {
+                'generated_at': utc_now().isoformat(),
+                'user_list': [{'id': u.id, 'username': u.username, 'steam_connected': u.is_steam_connected} for u in users]
+            }
+        }), 200
+        
+    except APIException as e:
+        return jsonify({'success': False, 'error': e.message}), e.status_code
+    except Exception as e:
+        current_app.logger.error(f"Error in common_games: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': 'Failed to find common games. Please try again later.'
+        }), 500
+
+@steam.route('/game-details/<int:app_id>', methods=['GET'])
+@jwt_required()
+def get_game_details(app_id):
+    """Get detailed information about a specific game with caching"""
+    limiter = get_limiter()
+    if limiter:
+        # Rate limit game details to prevent Steam API abuse
+        limiter.limit("60 per minute")(lambda: None)()
+    
+    try:
+        if not steam_service:
+            return jsonify({
+                'error': 'Steam service not available',
+                'message': 'Steam integration is currently unavailable'
+            }), 503
+        
+        # Validate app_id
+        if app_id <= 0:
+            return jsonify({'error': 'Invalid Steam app ID'}), 400
+        
+        current_app.logger.info(f"Fetching details for Steam app {app_id}")
+        
+        # Check if we already have this game in our database
+        existing_game = SteamGame.query.filter_by(steam_appid=app_id).first()
+        if existing_game:
+            return jsonify({
+                'success': True,
+                'game': existing_game.serialize(),
+                'source': 'database'
+            }), 200
+        
+        # Fetch from Steam API
+        details = steam_service.get_game_details(app_id)
+        
+        if not details:
+            return jsonify({
+                'error': 'Game not found',
+                'message': f'No game found with Steam app ID {app_id}'
+            }), 404
+        
+        return jsonify({
+            'success': True,
+            'game': details,
+            'source': 'steam_api'
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error getting game details for {app_id}: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': 'Failed to fetch game details. Please try again later.'
+        }), 500
+
+@steam.route('/user-profile', methods=['GET'])
+@jwt_required()
+def get_steam_profile():
+    """Get user's Steam profile information with enhanced error handling"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+            
+        if not user.steam_id:
+            return jsonify({
+                'error': 'Steam not connected',
+                'message': 'Please connect your Steam account first',
+                'cached_data': None
+            }), 400
+        
+        # Get fresh profile data from Steam API
+        if steam_service:
+            try:
+                profile = steam_service.get_user_profile(user.steam_id)
+                
+                # Update user data if we got fresh info
+                if profile:
+                    user.steam_username = profile.get('personaname', user.steam_username)
+                    user.steam_avatar_url = profile.get('avatarfull', user.steam_avatar_url)
+                    user.steam_profile_url = profile.get('profileurl', user.steam_profile_url)
+                    db.session.commit()
+                
+                return jsonify({
+                    'success': True,
+                    'steam_profile': profile,
+                    'cached_data': {
+                        'steam_username': user.steam_username,
+                        'steam_avatar_url': user.steam_avatar_url,
+                        'steam_profile_url': user.steam_profile_url,
+                        'last_synced': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None
+                    }
+                }), 200
+            except Exception as e:
+                current_app.logger.warning(f"Steam API call failed for profile, using cached data: {str(e)}")
+                # Fall back to cached data if API fails
+                return jsonify({
+                    'success': True,
+                    'steam_profile': None,
+                    'cached_data': {
+                        'steam_username': user.steam_username,
+                        'steam_avatar_url': user.steam_avatar_url,
+                        'steam_profile_url': user.steam_profile_url,
+                        'last_synced': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None
+                    },
+                    'api_error': 'Steam API temporarily unavailable'
+                }), 200
+        else:
+            return jsonify({
+                'error': 'Steam service not available',
+                'message': 'Steam integration is currently unavailable'
+            }), 503
+        
+    except Exception as e:
+        current_app.logger.error(f"Error getting Steam profile: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': 'Failed to fetch Steam profile. Please try again later.'
+        }), 500
+
+@steam.route('/connect-status', methods=['GET'])
+@jwt_required()
+def get_connection_status():
+    """Get detailed Steam connection status for user with SSE integration info"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Get detailed connection info
+        connection_info = {
+            'steam_connected': user.is_steam_connected,
+            'steam_id': user.steam_id,
+            'steam_username': user.steam_username,
+            'steam_avatar_url': user.steam_avatar_url,
+            'steam_profile_url': user.steam_profile_url,
+            'total_games': user.total_games or 0,
+            'last_synced': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None
+        }
+        
+        # Get active voting sessions with enhanced info
+        active_sessions = get_user_active_sessions_info(user_id)
+        
+        # SSE integration benefits
+        live_voting_manager = get_live_voting_manager()
+        sse_benefits = {
+            'real_time_updates_available': live_voting_manager is not None,
+            'active_session_count': len(active_sessions),
+            'will_receive_notifications': live_voting_manager is not None and len(active_sessions) > 0
+        }
+        
+        return jsonify({
+            'success': True,
+            'connection_info': connection_info,
+            'active_sessions': active_sessions,
+            'sse_integration': sse_benefits,
+            'benefits': {
+                'can_participate_in_voting': user.is_steam_connected,
+                'can_share_games': user.is_steam_connected and user.total_games > 0,
+                'real_time_updates': user.is_steam_connected and sse_benefits['will_receive_notifications']
+            }
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error getting connection status: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error'
+        }), 500
+
+@steam.route('/status', methods=['GET'])
+@jwt_required()
+def steam_status():
+    """Get comprehensive Steam service status and user's connection info"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Check Steam service availability
+        steam_available = steam_service is not None
+        api_key_configured = bool(steam_service and steam_service.api_key) if steam_available else False
+        
+        # Get sync status using User model helper methods
+        sync_status = user.get_steam_sync_status() if user.steam_id else {
+            "connected": False,
+            "can_sync": False,
+            "message": "Steam account not connected",
+            "last_synced": None,
+            "cooldown_remaining": 0
+        }
+        
+        # 🚀 ENHANCED: Comprehensive live voting integration status
+        live_voting_manager = get_live_voting_manager()
+        integration_status = {
+            'sse_available': live_voting_manager is not None,
+            'can_broadcast_updates': live_voting_manager is not None and user.is_steam_connected,
+            'active_sessions': get_user_active_sessions_info(user_id),
+            'total_sse_connections': 0
+        }
+        
+        if live_voting_manager:
+            total_connections = sum(
+                len(connections) 
+                for connections in live_voting_manager.session_connections.values()
+            )
+            integration_status['total_sse_connections'] = total_connections
+        
+        return jsonify({
+            'success': True,
+            'steam_service': {
+                'available': steam_available,
+                'api_key_configured': api_key_configured,
+                'status': 'operational' if steam_available and api_key_configured else 'limited'
+            },
+            'user_connection': {
+                'connected': user.is_steam_connected,
+                'steam_id': user.steam_id if user.is_steam_connected else None,
+                'steam_username': user.steam_username if user.is_steam_connected else None,
+                'total_games': user.total_games if user.is_steam_connected else 0,
+                'last_synced': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None
+            },
+            'sync_status': sync_status,
+            'integration_status': integration_status
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error getting Steam status: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error'
+        }), 500
+
+# ============================================================================
+# 🚀 ENHANCED HEALTH CHECK AND DEBUGGING ENDPOINTS
+# ============================================================================
+
+@steam.route('/health', methods=['GET'])
+def steam_health():
+    """Comprehensive Steam service health check with SSE integration status"""
+    try:
+        health_status = {
+            'steam_service': 'available' if steam_service else 'unavailable',
+            'api_key': 'configured' if (steam_service and steam_service.api_key) else 'missing',
+            'database': 'unknown',
+            'sse_integration': 'unknown'
+        }
+        
+        # Test database connection
+        try:
+            db.session.execute(text('SELECT 1'))
+            health_status['database'] = 'healthy'
+        except Exception as e:
+            health_status['database'] = 'unhealthy'
+            current_app.logger.error(f"Database health check failed: {e}")
+        
+        # Test SSE integration
+        live_voting_manager = get_live_voting_manager()
+        if live_voting_manager:
+            health_status['sse_integration'] = 'available'
+            # Get connection stats
+            total_connections = sum(
+                len(connections) 
+                for connections in live_voting_manager.session_connections.values()
+            )
+            health_status['sse_connections'] = total_connections
+        else:
+            health_status['sse_integration'] = 'unavailable'
+            health_status['sse_connections'] = 0
+        
+        # Test Steam API if available
+        if steam_service and steam_service.api_key:
+            try:
+                # Quick test - get details for a known game (e.g., Counter-Strike)
+                test_result = steam_service.get_game_details(730)
+                health_status['steam_api'] = 'responding' if test_result else 'not_responding'
+            except Exception as e:
+                health_status['steam_api'] = 'error'
+                current_app.logger.warning(f"Steam API health check failed: {e}")
+        else:
+            health_status['steam_api'] = 'not_configured'
+        
+        # Calculate overall status
+        critical_components = ['steam_service', 'api_key', 'database']
+        critical_healthy = all(
+            health_status[comp] in ['available', 'configured', 'healthy'] 
+            for comp in critical_components
+        )
+        
+        overall_status = 'healthy' if critical_healthy else 'degraded'
+        
+        return jsonify({
+            'status': overall_status,
+            'components': health_status,
+            'sse_integration': {
+                'available': health_status['sse_integration'] == 'available',
+                'active_connections': health_status.get('sse_connections', 0)
+            },
+            'timestamp': utc_now().isoformat()
+        }), 200 if overall_status == 'healthy' else 503
+        
+    except Exception as e:
+        current_app.logger.error(f"Steam health check error: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'timestamp': utc_now().isoformat()
+        }), 500
+
+@steam.route('/debug/active-sessions', methods=['GET'])
+@jwt_required()
+def debug_active_sessions():
+    """🚀 ENHANCED: Debug endpoint with comprehensive session and SSE information"""
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Get detailed active sessions info
+        active_sessions_info = get_user_active_sessions_info(user_id)
+        
+        # Check SSE integration with detailed stats
+        live_voting_manager = get_live_voting_manager()
+        sse_status = {
+            'manager_available': live_voting_manager is not None,
+            'active_connections': 0,
+            'session_connections': {},
+            'broadcasting_capabilities': []
+        }
+        
+        if live_voting_manager:
+            # Get detailed connection stats per session
+            for session_id, connections in live_voting_manager.session_connections.items():
+                sse_status['session_connections'][session_id] = len(connections)
+            
+            sse_status['active_connections'] = sum(sse_status['session_connections'].values())
+            
+            # List available broadcasting methods
+            sse_status['broadcasting_capabilities'] = [
+                'broadcast_steam_sync_update',
+                'broadcast_steam_connection_change',
+                '_update_and_broadcast_steam_coverage',
+                'broadcast_to_session'
+            ]
+        
+        # Steam integration readiness
+        steam_readiness = {
+            'connected': user.is_steam_connected,
+            'can_sync': user.can_sync_steam()[0] if user.is_steam_connected else False,
+            'total_games': user.total_games or 0,
+            'last_synced': user.steam_library_synced_at.isoformat() if user.steam_library_synced_at else None,
+            'can_broadcast_updates': live_voting_manager is not None and user.is_steam_connected
+        }
+        
+        return jsonify({
+            'success': True,
+            'debug_info': {
+                'user_id': user_id,
+                'username': user.username,
+                'timestamp': utc_now().isoformat()
+            },
+            'steam_readiness': steam_readiness,
+            'active_sessions': {
+                'sessions': active_sessions_info,
+                'count': len(active_sessions_info),
+                'total_members_across_sessions': sum(s['total_members'] for s in active_sessions_info),
+                'total_steam_members_across_sessions': sum(s['steam_connected_members'] for s in active_sessions_info)
+            },
+            'sse_status': sse_status,
+            'broadcasting_test': {
+                'can_test_broadcast': live_voting_manager is not None and len(active_sessions_info) > 0,
+                'sessions_ready_for_broadcast': [s['id'] for s in active_sessions_info]
+            }
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error in debug endpoint: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'details': str(e)
+        }), 500
+
+@steam.route('/debug/sse-status', methods=['GET'])
+@jwt_required()
+def debug_sse_status():
+    """🚀 NEW: Comprehensive SSE broadcasting status and diagnostics"""
+    try:
+        user_id = get_jwt_identity()
+        live_voting_manager = get_live_voting_manager()
+        
+        if not live_voting_manager:
+            return jsonify({
+                'sse_available': False,
+                'error': 'Live voting manager not available',
+                'timestamp': utc_now().isoformat()
+            }), 503
+        
+        # Get comprehensive SSE status
+        session_connections = {}
+        total_connections = 0
+        
+        for session_id, connections in live_voting_manager.session_connections.items():
+            connection_count = len(connections)
+            session_connections[session_id] = {
+                'connection_count': connection_count,
+                'connection_ids': [str(conn) for conn in connections]  # Convert to strings for JSON
+            }
+            total_connections += connection_count
+        
+        # Get user's session involvement
+        user_sessions = get_user_active_sessions_info(user_id)
+        user_session_ids = [s['id'] for s in user_sessions]
+        
+        # Calculate which of user's sessions have active SSE connections
+        connected_user_sessions = [
+            session_id for session_id in user_session_ids 
+            if session_id in session_connections
+        ]
+        
+        return jsonify({
+            'sse_available': True,
+            'global_stats': {
+                'total_active_connections': total_connections,
+                'total_active_sessions_with_connections': len(session_connections),
+                'average_connections_per_session': total_connections / len(session_connections) if session_connections else 0
+            },
+            'session_connections': session_connections,
+            'user_session_involvement': {
+                'user_active_sessions': user_session_ids,
+                'sessions_with_sse_connections': connected_user_sessions,
+                'user_sessions_connected_percentage': (len(connected_user_sessions) / len(user_session_ids) * 100) if user_session_ids else 0
+            },
+            'broadcasting_capabilities': {
+                'steam_sync_update': 'Available',
+                'steam_connection_change': 'Available',
+                'steam_coverage_update': 'Available',
+                'generic_broadcast': 'Available'
+            },
+            'performance_metrics': {
+                'manager_instance_available': True,
+                'session_lookup_performance': 'Optimized with dictionary storage',
+                'broadcast_method': 'Direct SSE to active connections'
+            },
+            'timestamp': utc_now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error in SSE debug endpoint: {str(e)}")
+        return jsonify({
+            'sse_available': False,
+            'error': str(e),
+            'timestamp': utc_now().isoformat()
+        }), 500
+
+@steam.route('/debug/test-broadcast', methods=['POST'])
+@jwt_required()
+def debug_test_broadcast():
+    """🚀 NEW: Test broadcasting functionality (development/debug only)"""
+    try:
+        # Only allow in development or if explicitly enabled
+        if not current_app.config.get('DEBUG') and not current_app.config.get('ENABLE_STEAM_DEBUG'):
+            return jsonify({
+                'error': 'Test broadcasting only available in development mode',
+                'available': False
+            }), 403
+        
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        live_voting_manager = get_live_voting_manager()
+        if not live_voting_manager:
+            return jsonify({
+                'error': 'Live voting manager not available',
+                'broadcast_sent': False
+            }), 503
+        
+        # Get test parameters
+        data = request.get_json() or {}
+        test_type = data.get('test_type', 'sync_update')
+        
+        # Create test data based on type
+        if test_type == 'sync_update':
+            test_data = {
+                'user_id': user_id,
+                'username': user.username,
+                'total_games': user.total_games or 42,
+                'new_games': 5,
+                'updated_games': 2,
+                'steam_username': user.steam_username or 'TestSteamUser'
+            }
+        elif test_type == 'connection_change':
+            test_data = {
+                'user_id': user_id,
+                'username': user.username,
+                'steam_username': user.steam_username or 'TestSteamUser',
+                'action': 'connected'
+            }
+        else:
+            return jsonify({'error': f'Unknown test type: {test_type}'}), 400
+        
+        # Send test broadcast
+        broadcasts_sent = broadcast_to_active_sessions(user_id, test_type, test_data, live_voting_manager)
+        
+        return jsonify({
+            'success': True,
+            'test_type': test_type,
+            'test_data': test_data,
+            'broadcasts_sent': broadcasts_sent,
+            'message': f'Test broadcast sent to {broadcasts_sent} active sessions',
+            'timestamp': utc_now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error in test broadcast: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'broadcasts_sent': 0
+        }), 500

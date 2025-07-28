@@ -1,6 +1,8 @@
-// src/front/store/store.js - ENHANCED VERSION with gaming state
+// src/front/store/store.js - FIXED VERSION with useGlobalReducer hook and live voting state
 
-// ENHANCED: More robust initial state function with gaming state
+import { useReducer, createContext, useContext } from 'react';
+
+// ENHANCED: More robust initial state function with live voting state
 export const initialStore = () => {
     // Get stored values, but validate them first
     const getStoredToken = () => {
@@ -102,6 +104,21 @@ export const initialStore = () => {
             selectedGame: null
         },
         
+        // 🚀 NEW: Live voting state for useLiveVoting hook
+        liveVoting: {
+            isActive: false,
+            sessionId: null,
+            members: [],
+            votedUsers: [],
+            pendingUsers: [],
+            currentVoter: null,
+            allVotesComplete: false,
+            progress: 0,
+            status: 'inactive',
+            error: null,
+            connectionStatus: 'disconnected'
+        },
+        
         // Animation state
         animationsEnabled: true, 
         
@@ -123,7 +140,7 @@ export const initialStore = () => {
     };
 };
 
-// Action types - Enhanced with gaming actions
+// Action types - Enhanced with live voting actions
 export const ACTION_TYPES = {
     // Demo actions
     SET_HELLO: 'set_hello',
@@ -170,15 +187,26 @@ export const ACTION_TYPES = {
     SET_LIVE_RESULTS_SOURCE: 'set_live_results_source',
     CLEAR_LIVE_RESULTS: 'clear_live_results',
     
+    // 🚀 NEW: Live voting actions for useLiveVoting hook
+    START_VOTING_SESSION: 'start_voting_session',
+    END_VOTING_SESSION: 'end_voting_session',
+    USER_VOTED: 'user_voted',
+    USER_PENDING: 'user_pending',
+    SET_CURRENT_VOTER: 'set_current_voter',
+    ALL_VOTES_COMPLETE: 'all_votes_complete',
+    UPDATE_VOTING_MEMBERS: 'update_voting_members',
+    VOTING_REMINDER_SENT: 'voting_reminder_sent',
+    VOTING_TIME_WARNING: 'voting_time_warning',
+    SET_VOTING_CONNECTION_STATUS: 'set_voting_connection_status',
+    RESET_VOTING_STATE: 'reset_voting_state',
+    
     // UI state
     TOGGLE_MEMBER_MODAL: 'toggle_member_modal',
     TOGGLE_VOTING_MODAL: 'toggle_voting_modal',
-    SET_SELECTED_GAME: 'set_selected_game',
-
-
+    SET_SELECTED_GAME: 'set_selected_game'
 };
 
-// ENHANCED: More robust reducer with gaming state management
+// ENHANCED: More robust reducer with live voting state management
 const storeReducer = (state, action) => {
     console.log('🔄 Reducer called:', action.type, action.payload);
     
@@ -301,7 +329,7 @@ const storeReducer = (state, action) => {
         case ACTION_TYPES.LOGOUT:
             console.log('🚪 LOGOUT reducer called');
             
-            // ENHANCED: More thorough logout cleanup including gaming state
+            // ENHANCED: More thorough logout cleanup including live voting state
             const logoutState = {
                 ...state,
                 user: null,
@@ -323,6 +351,20 @@ const storeReducer = (state, action) => {
                     // Close live results connection
                     liveResultsEventSource: state.gaming.liveResultsEventSource ? 
                         (state.gaming.liveResultsEventSource.close(), null) : null
+                },
+                // Clear live voting state
+                liveVoting: {
+                    isActive: false,
+                    sessionId: null,
+                    members: [],
+                    votedUsers: [],
+                    pendingUsers: [],
+                    currentVoter: null,
+                    allVotesComplete: false,
+                    progress: 0,
+                    status: 'inactive',
+                    error: null,
+                    connectionStatus: 'disconnected'
                 }
             };
             
@@ -535,6 +577,126 @@ const storeReducer = (state, action) => {
                 }
             };
 
+        // 🚀 NEW: Live voting actions for useLiveVoting hook
+        case ACTION_TYPES.START_VOTING_SESSION:
+            return {
+                ...state,
+                liveVoting: {
+                    ...state.liveVoting,
+                    isActive: true,
+                    sessionId: action.payload.sessionId,
+                    members: action.payload.members || [],
+                    votedUsers: [],
+                    pendingUsers: action.payload.members || [],
+                    status: 'voting',
+                    error: null,
+                    progress: 0
+                }
+            };
+
+        case ACTION_TYPES.END_VOTING_SESSION:
+            return {
+                ...state,
+                liveVoting: {
+                    ...state.liveVoting,
+                    isActive: false,
+                    status: 'completed',
+                    allVotesComplete: true
+                }
+            };
+
+        case ACTION_TYPES.USER_VOTED:
+            const votedUser = action.payload;
+            return {
+                ...state,
+                liveVoting: {
+                    ...state.liveVoting,
+                    votedUsers: [...state.liveVoting.votedUsers.filter(u => u.id !== votedUser.userId), {
+                        id: votedUser.userId,
+                        voteData: votedUser.voteData,
+                        timestamp: votedUser.timestamp
+                    }],
+                    pendingUsers: state.liveVoting.pendingUsers.filter(u => u.id !== votedUser.userId),
+                    progress: Math.round(((state.liveVoting.votedUsers.length + 1) / state.liveVoting.members.length) * 100)
+                }
+            };
+
+        case ACTION_TYPES.USER_PENDING:
+            return {
+                ...state,
+                liveVoting: {
+                    ...state.liveVoting,
+                    pendingUsers: [...state.liveVoting.pendingUsers.filter(u => u.id !== action.payload.userId), {
+                        id: action.payload.userId,
+                        reason: action.payload.reason
+                    }]
+                }
+            };
+
+        case ACTION_TYPES.SET_CURRENT_VOTER:
+            return {
+                ...state,
+                liveVoting: {
+                    ...state.liveVoting,
+                    currentVoter: action.payload
+                }
+            };
+
+        case ACTION_TYPES.ALL_VOTES_COMPLETE:
+            return {
+                ...state,
+                liveVoting: {
+                    ...state.liveVoting,
+                    allVotesComplete: true,
+                    status: 'completed',
+                    progress: 100
+                }
+            };
+
+        case ACTION_TYPES.UPDATE_VOTING_MEMBERS:
+            return {
+                ...state,
+                liveVoting: {
+                    ...state.liveVoting,
+                    members: action.payload.members || state.liveVoting.members
+                }
+            };
+
+        case ACTION_TYPES.VOTING_REMINDER_SENT:
+            // Could track reminder history if needed
+            return state;
+
+        case ACTION_TYPES.VOTING_TIME_WARNING:
+            // Could show time warnings in UI
+            return state;
+
+        case ACTION_TYPES.SET_VOTING_CONNECTION_STATUS:
+            return {
+                ...state,
+                liveVoting: {
+                    ...state.liveVoting,
+                    connectionStatus: action.payload
+                }
+            };
+
+        case ACTION_TYPES.RESET_VOTING_STATE:
+            return {
+                ...state,
+                liveVoting: {
+                    isActive: false,
+                    sessionId: null,
+                    members: [],
+                    votedUsers: [],
+                    pendingUsers: [],
+                    currentVoter: null,
+                    allVotesComplete: false,
+                    progress: 0,
+                    status: 'inactive',
+                    error: null,
+                    connectionStatus: 'disconnected'
+                }
+            };
+
         // UI State Actions - NEW
         case ACTION_TYPES.TOGGLE_MEMBER_MODAL:
             return {
@@ -569,7 +731,107 @@ const storeReducer = (state, action) => {
     }
 };
 
-// ENHANCED: Add state validation helper with gaming validation
+// 🚀 Enhanced selectors object for useLiveVoting hook
+export const selectors = {
+    // Live voting specific selectors
+    selectIsVotingActive: (state) => state.liveVoting?.isActive || false,
+    selectVotingSession: (state) => state.liveVoting?.sessionId || null,
+    selectVotingMembers: (state) => state.liveVoting?.members || [],
+    selectVotedUsers: (state) => state.liveVoting?.votedUsers || [],
+    selectPendingUsers: (state) => state.liveVoting?.pendingUsers || [],
+    selectCurrentVoter: (state) => state.liveVoting?.currentVoter || null,
+    selectAllVotesComplete: (state) => state.liveVoting?.allVotesComplete || false,
+    selectVotingProgress: (state) => {
+        const members = state.liveVoting?.members || [];
+        const voted = state.liveVoting?.votedUsers || [];
+        if (members.length === 0) return 0;
+        return Math.round((voted.length / members.length) * 100);
+    },
+    selectSessionStatus: (state) => state.liveVoting?.status || 'inactive',
+    selectVotingError: (state) => state.liveVoting?.error || null
+};
+
+// 🚀 Voting helpers for useLiveVoting hook
+export const votingHelpers = {
+    startVotingSession: (dispatch, sessionData) => {
+        dispatch({
+            type: ACTION_TYPES.START_VOTING_SESSION,
+            payload: sessionData
+        });
+    },
+    
+    handleVoteUpdate: (dispatch, updateData) => {
+        const { userId, action, voteData, timestamp } = updateData;
+        
+        switch (action) {
+            case 'voted':
+                dispatch({
+                    type: ACTION_TYPES.USER_VOTED,
+                    payload: {
+                        userId,
+                        voteData,
+                        timestamp: timestamp || new Date().toISOString()
+                    }
+                });
+                break;
+                
+            case 'pending':
+                dispatch({
+                    type: ACTION_TYPES.USER_PENDING,
+                    payload: {
+                        userId,
+                        reason: updateData.reason
+                    }
+                });
+                break;
+                
+            default:
+                console.warn('Unknown vote action:', action);
+        }
+    },
+
+    endVotingSession: (dispatch, endData = {}) => {
+        dispatch({
+            type: ACTION_TYPES.END_VOTING_SESSION,
+            payload: {
+                reason: endData.reason || 'manual',
+                endedBy: endData.endedBy,
+                endTime: new Date().toISOString()
+            }
+        });
+    },
+
+    resetVotingState: (dispatch) => {
+        dispatch({
+            type: ACTION_TYPES.RESET_VOTING_STATE,
+            payload: {}
+        });
+    }
+};
+
+// 🔥 CRITICAL: Create the useGlobalReducer hook that your components expect
+const GlobalStoreContext = createContext();
+
+export const useGlobalReducer = () => {
+    const context = useContext(GlobalStoreContext);
+    if (!context) {
+        throw new Error('useGlobalReducer must be used within a GlobalStoreProvider');
+    }
+    return context;
+};
+
+// Provider component for the global store
+export const GlobalStoreProvider = ({ children }) => {
+    const [store, dispatch] = useReducer(storeReducer, initialStore());
+    
+    return (
+        <GlobalStoreContext.Provider value={{ store, dispatch }}>
+            {children}
+        </GlobalStoreContext.Provider>
+    );
+};
+
+// ENHANCED: Add state validation helper with live voting validation
 export const validateState = (state) => {
     const errors = [];
     
@@ -597,6 +859,11 @@ export const validateState = (state) => {
         errors.push('gaming state is missing or invalid');
     }
     
+    // Validate live voting state structure
+    if (!state.liveVoting || typeof state.liveVoting !== 'object') {
+        errors.push('liveVoting state is missing or invalid');
+    }
+    
     // Validate gaming state arrays
     if (state.gaming) {
         if (!Array.isArray(state.gaming.userGroups)) {
@@ -611,9 +878,23 @@ export const validateState = (state) => {
         if (!Array.isArray(state.gaming.userVotes)) {
             errors.push('gaming.userVotes is not an array');
         }
-        if (!Array.isArray(state.messages)) {
-            errors.push('messages is not an array');
+    }
+    
+    // Validate live voting arrays
+    if (state.liveVoting) {
+        if (!Array.isArray(state.liveVoting.members)) {
+            errors.push('liveVoting.members is not an array');
         }
+        if (!Array.isArray(state.liveVoting.votedUsers)) {
+            errors.push('liveVoting.votedUsers is not an array');
+        }
+        if (!Array.isArray(state.liveVoting.pendingUsers)) {
+            errors.push('liveVoting.pendingUsers is not an array');
+        }
+    }
+    
+    if (!Array.isArray(state.messages)) {
+        errors.push('messages is not an array');
     }
     
     if (errors.length > 0) {
@@ -633,45 +914,6 @@ export const getGamingSelectors = (state) => ({
     getGroupError: () => state.gaming.groupError,
     
     // Voting selectors
-
-// 🚀 Enhanced selectors object for useLiveVoting hook
-export const selectors = {
-    // Live voting specific selectors
-    selectIsVotingActive: (state) => state.liveVoting?.isActive || false,
-    selectVotingSession: (state) => state.liveVoting?.sessionId || null,
-    selectVotingMembers: (state) => state.liveVoting?.members || [],
-    selectVotedUsers: (state) => state.liveVoting?.votedUsers || [],
-    selectPendingUsers: (state) => state.liveVoting?.pendingUsers || [],
-    selectCurrentVoter: (state) => state.liveVoting?.currentVoter || null,
-    selectAllVotesComplete: (state) => state.liveVoting?.allVotesComplete || false,
-    selectVotingProgress: (state) => {
-        const members = state.liveVoting?.members || [];
-        const voted = state.liveVoting?.votedUsers || [];
-        if (members.length === 0) return 0;
-        return Math.round((voted.length / members.length) * 100);
-    },
-    selectSessionStatus: (state) => state.liveVoting?.status || 'inactive',
-    selectVotingError: (state) => state.liveVoting?.error || null
-};
-
-// 🚀 Voting helpers for useLiveVoting hook
-export const votingHelpers = {
-    startVotingSession: (dispatch, sessionData) => {
-        dispatch({ type: ACTION_TYPES.START_VOTING_SESSION, payload: sessionData });
-    },
-    handleVoteUpdate: (dispatch, updateData) => {
-        const { userId, action } = updateData;
-        if (action === 'voted') {
-            dispatch({ type: ACTION_TYPES.USER_VOTED, payload: updateData });
-        } else if (action === 'pending') {
-            dispatch({ type: ACTION_TYPES.USER_PENDING, payload: updateData });
-        }
-    },
-    endVotingSession: (dispatch, endData = {}) => {
-        dispatch({ type: ACTION_TYPES.END_VOTING_SESSION, payload: endData });
-    }
-};
-
     getActiveSession: () => state.gaming.activeSession,
     getSessionResults: () => state.gaming.sessionResults,
     getSessionVoters: () => state.gaming.sessionVoters,
@@ -687,49 +929,6 @@ export const votingHelpers = {
     isMemberModalOpen: () => state.gaming.showMemberModal,
     isVotingModalOpen: () => state.gaming.showVotingModal,
     getSelectedGame: () => state.gaming.selectedGame,
-
-// 🚀 Enhanced selectors object for useLiveVoting hook
-                        timestamp: timestamp || new Date().toISOString()
-                    }
-                });
-                break;
-                
-            case 'pending':
-                dispatch({
-                    type: ACTION_TYPES.USER_PENDING,
-                    payload: {
-                        userId,
-                        reason: updateData.reason
-                    }
-                });
-                break;
-                
-            default:
-                console.warn('Unknown vote action:', action);
-        }
-    },
-
-    // End voting session
-    endVotingSession: (dispatch, endData = {}) => {
-        dispatch({
-            type: ACTION_TYPES.END_VOTING_SESSION,
-            payload: {
-                reason: endData.reason || 'manual',
-                endedBy: endData.endedBy,
-                endTime: new Date().toISOString()
-            }
-        });
-    },
-
-    // Reset voting state
-    resetVotingState: (dispatch) => {
-        dispatch({
-            type: ACTION_TYPES.RESET_VOTING_STATE,
-            payload: {}
-        });
-    }
-};
-
     
     // User role selectors
     isCurrentUserGroupCreator: () => {
@@ -746,40 +945,3 @@ export const votingHelpers = {
 });
 
 export default storeReducer;
-// 🚀 Enhanced selectors object for useLiveVoting hook
-export const selectors = {
-    // Live voting specific selectors
-    selectIsVotingActive: (state) => state.liveVoting?.isActive || false,
-    selectVotingSession: (state) => state.liveVoting?.sessionId || null,
-    selectVotingMembers: (state) => state.liveVoting?.members || [],
-    selectVotedUsers: (state) => state.liveVoting?.votedUsers || [],
-    selectPendingUsers: (state) => state.liveVoting?.pendingUsers || [],
-    selectCurrentVoter: (state) => state.liveVoting?.currentVoter || null,
-    selectAllVotesComplete: (state) => state.liveVoting?.allVotesComplete || false,
-    selectVotingProgress: (state) => {
-        const members = state.liveVoting?.members || [];
-        const voted = state.liveVoting?.votedUsers || [];
-        if (members.length === 0) return 0;
-        return Math.round((voted.length / members.length) * 100);
-    },
-    selectSessionStatus: (state) => state.liveVoting?.status || 'inactive',
-    selectVotingError: (state) => state.liveVoting?.error || null
-};
-
-// 🚀 Voting helpers for useLiveVoting hook
-export const votingHelpers = {
-    startVotingSession: (dispatch, sessionData) => {
-        dispatch({ type: ACTION_TYPES.START_VOTING_SESSION, payload: sessionData });
-    },
-    handleVoteUpdate: (dispatch, updateData) => {
-        const { userId, action } = updateData;
-        if (action === 'voted') {
-            dispatch({ type: ACTION_TYPES.USER_VOTED, payload: updateData });
-        } else if (action === 'pending') {
-            dispatch({ type: ACTION_TYPES.USER_PENDING, payload: updateData });
-        }
-    },
-    endVotingSession: (dispatch, endData = {}) => {
-        dispatch({ type: ACTION_TYPES.END_VOTING_SESSION, payload: endData });
-    }
-};

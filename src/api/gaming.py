@@ -1,4 +1,4 @@
-# src/api/gaming.py - FIXED VERSION with all missing endpoints and correct relationship usage
+# src/api/gaming.py - ENHANCED with Steam integration and SSE broadcasting
 
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity, verify_jwt_in_request
@@ -10,6 +10,15 @@ import json
 from sqlalchemy import func
 
 gaming = Blueprint('gaming', __name__)
+
+def get_live_voting_manager():
+    """Get the live voting manager for SSE broadcasting"""
+    try:
+        from .live_voting_system import live_voting_manager
+        return live_voting_manager
+    except ImportError:
+        current_app.logger.warning("Live voting manager not available for Steam SSE broadcasting")
+        return None
 
 # ============================================================================
 # JWT ERROR HANDLERS - FIXES 401 ERRORS
@@ -51,18 +60,27 @@ def get_current_user():
         raise APIException('Authentication failed', 401)
 
 # ============================================================================
-# GROUP MANAGEMENT ENDPOINTS 
+# 🔧 ENHANCED GROUP MANAGEMENT WITH STEAM AWARENESS
 # ============================================================================
 
 @gaming.route('/groups', methods=['GET'])
 @jwt_required()
 def get_user_groups():
-    """Get all gaming groups for the current user"""
+    """🔧 ENHANCED: Get all gaming groups for the current user with Steam coverage info"""
     try:
         user = get_current_user()
         
         user_groups = []
         for group in user.groups:
+            # Calculate Steam coverage for group
+            steam_members = [m for m in group.members if m.is_steam_connected]
+            total_members = len(group.members)
+            steam_coverage = {
+                'connected': len(steam_members),
+                'total': total_members,
+                'percentage': (len(steam_members) / total_members * 100) if total_members > 0 else 0
+            }
+            
             group_data = {
                 'id': group.id,
                 'name': group.name,
@@ -77,7 +95,9 @@ def get_user_groups():
                 'is_public': group.is_public,
                 'created_at': group.created_at.isoformat(),
                 'is_creator': group.creator_id == user.id,
-                'has_active_session': any(s.status in ['planning', 'voting'] for s in group.sessions)
+                'has_active_session': any(s.status in ['planning', 'voting'] for s in group.sessions),
+                'steam_coverage': steam_coverage,
+                'ready_for_voting': steam_coverage['connected'] >= 2 and steam_coverage['percentage'] >= 50
             }
             user_groups.append(group_data)
         
@@ -153,7 +173,7 @@ def create_group():
 @gaming.route('/groups/<int:group_id>', methods=['GET'])
 @jwt_required()
 def get_group_details(group_id):
-    """Get detailed information about a specific group"""
+    """🔧 ENHANCED: Get detailed information about a specific group with Steam status"""
     try:
         user = get_current_user()
         
@@ -176,6 +196,24 @@ def get_group_details(group_id):
             }
             recent_sessions.append(session_data)
         
+        # Calculate Steam coverage and common games
+        steam_members = [m for m in group.members if m.is_steam_connected]
+        total_members = len(group.members)
+        steam_coverage = {
+            'connected': len(steam_members),
+            'total': total_members,
+            'percentage': (len(steam_members) / total_members * 100) if total_members > 0 else 0
+        }
+        
+        # Get common games count
+        common_games_count = 0
+        if len(steam_members) >= 2:
+            try:
+                common_games = get_group_common_games(group.id)
+                common_games_count = len(common_games)
+            except Exception as e:
+                current_app.logger.warning(f"Could not get common games: {e}")
+        
         group_data = {
             'id': group.id,
             'name': group.name,
@@ -196,11 +234,22 @@ def get_group_details(group_id):
                     'username': member.username,
                     'avatar_url': member.avatar_url or member.steam_avatar_url,
                     'steam_connected': member.steam_connected or member.is_steam_connected,
-                    'total_games': member.total_games or 0
+                    'steam_username': member.steam_username if member.is_steam_connected else None,
+                    'total_games': member.total_games or 0,
+                    'last_synced': member.steam_library_synced_at.isoformat() if member.steam_library_synced_at else None
                 } for member in group.members
             ],
             'recent_sessions': recent_sessions,
-            'has_active_session': any(s.status in ['planning', 'voting'] for s in group.sessions)
+            'has_active_session': any(s.status in ['planning', 'voting'] for s in group.sessions),
+            'steam_coverage': steam_coverage,
+            'common_games_count': common_games_count,
+            'ready_for_voting': steam_coverage['connected'] >= 2 and common_games_count > 0,
+            'voting_readiness': {
+                'can_vote': steam_coverage['connected'] >= 2,
+                'has_games': common_games_count > 0,
+                'good_coverage': steam_coverage['percentage'] >= 75,
+                'recommendations': _get_group_recommendations(steam_coverage, common_games_count, total_members)
+            }
         }
         
         return jsonify({'success': True, 'group': group_data}), 200
@@ -211,10 +260,29 @@ def get_group_details(group_id):
         current_app.logger.error(f"Error getting group details: {str(e)}")
         return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
+def _get_group_recommendations(steam_coverage, common_games_count, total_members):
+    """Generate recommendations for improving group voting readiness"""
+    recommendations = []
+    
+    if steam_coverage['connected'] < 2:
+        recommendations.append("Need at least 2 members to connect Steam for voting")
+    elif steam_coverage['percentage'] < 50:
+        recommendations.append("Get more members to connect Steam for better game matching")
+    
+    if common_games_count == 0 and steam_coverage['connected'] >= 2:
+        recommendations.append("Connected members should sync their Steam libraries")
+    elif common_games_count > 0 and common_games_count < 5:
+        recommendations.append("Limited game selection - consider expanding your Steam libraries")
+    
+    if steam_coverage['percentage'] >= 75 and common_games_count >= 5:
+        recommendations.append("✅ Ready for voting! Start a session to pick your next game")
+    
+    return recommendations
+
 @gaming.route('/groups/join/<invite_code>', methods=['POST'])
 @jwt_required()
 def join_group_by_invite(invite_code):
-    """Join a group using invite code"""
+    """🔧 ENHANCED: Join a group using invite code with Steam status update"""
     try:
         user = get_current_user()
         
@@ -231,13 +299,56 @@ def join_group_by_invite(invite_code):
         group.members.append(user)
         db.session.commit()
         
+        # 🔧 NEW: Check if there are active sessions and broadcast if SSE available
+        live_voting_manager = get_live_voting_manager()
+        if live_voting_manager:
+            try:
+                active_sessions = GameSession.query.filter_by(
+                    group_id=group.id
+                ).filter(
+                    GameSession.status.in_(['planning', 'voting'])
+                ).all()
+                
+                # Broadcast member join and Steam coverage update to active sessions
+                for session in active_sessions:
+                    try:
+                        # Update Steam coverage for the session
+                        live_voting_manager._update_and_broadcast_steam_coverage(session.id)
+                        
+                        # Broadcast new member joined
+                        live_voting_manager.broadcast_to_session(session.id, {
+                            'type': 'member_joined',
+                            'user_id': user.id,
+                            'username': user.username,
+                            'steam_connected': user.is_steam_connected,
+                            'timestamp': utc_now().isoformat()
+                        })
+                    except Exception as e:
+                        current_app.logger.warning(f"Failed to broadcast to session {session.id}: {e}")
+            except Exception as e:
+                current_app.logger.warning(f"Could not update active sessions: {e}")
+        
+        # Calculate new Steam coverage
+        steam_members = [m for m in group.members if m.is_steam_connected]
+        steam_coverage = {
+            'connected': len(steam_members),
+            'total': len(group.members),
+            'percentage': (len(steam_members) / len(group.members) * 100) if len(group.members) > 0 else 0
+        }
+        
         return jsonify({
             'success': True,
             'message': f'Successfully joined {group.name}',
             'group': {
                 'id': group.id,
                 'name': group.name,
-                'current_members': len(group.members)
+                'current_members': len(group.members),
+                'steam_coverage': steam_coverage
+            },
+            'steam_status': {
+                'connected': user.is_steam_connected,
+                'can_improve_coverage': not user.is_steam_connected,
+                'message': 'Connect Steam to participate in game voting' if not user.is_steam_connected else 'Ready to vote!'
             }
         }), 200
         
@@ -252,7 +363,7 @@ def join_group_by_invite(invite_code):
 @gaming.route('/groups/<int:group_id>/leave', methods=['POST'])
 @jwt_required()
 def leave_group(group_id):
-    """Leave a group"""
+    """🔧 ENHANCED: Leave a group with Steam coverage update broadcast"""
     try:
         user = get_current_user()
         
@@ -270,6 +381,20 @@ def leave_group(group_id):
                 'error': 'Transfer ownership before leaving'
             }), 400
         
+        # 🔧 NEW: Check for active sessions before leaving
+        live_voting_manager = get_live_voting_manager()
+        active_sessions = []
+        
+        if live_voting_manager:
+            try:
+                active_sessions = GameSession.query.filter_by(
+                    group_id=group.id
+                ).filter(
+                    GameSession.status.in_(['planning', 'voting'])
+                ).all()
+            except Exception as e:
+                current_app.logger.warning(f"Could not get active sessions: {e}")
+        
         group.members.remove(user)
         
         # If creator is leaving and they're the only member, delete the group
@@ -278,7 +403,32 @@ def leave_group(group_id):
         
         db.session.commit()
         
-        return jsonify({'success': True, 'message': 'Left group successfully'}), 200
+        # 🔧 NEW: Broadcast member left and Steam coverage update to active sessions
+        if live_voting_manager and active_sessions:
+            for session in active_sessions:
+                try:
+                    # Broadcast member left
+                    live_voting_manager.broadcast_to_session(session.id, {
+                        'type': 'member_left',
+                        'user_id': user.id,
+                        'username': user.username,
+                        'steam_connected': user.is_steam_connected,
+                        'timestamp': utc_now().isoformat()
+                    })
+                    
+                    # Update Steam coverage and refresh games
+                    live_voting_manager._update_and_broadcast_steam_coverage(session.id)
+                    if user.is_steam_connected:
+                        live_voting_manager.refresh_session_games(session.id)
+                        
+                except Exception as e:
+                    current_app.logger.warning(f"Failed to broadcast to session {session.id}: {e}")
+        
+        return jsonify({
+            'success': True, 
+            'message': 'Left group successfully',
+            'active_sessions_updated': len(active_sessions) if active_sessions else 0
+        }), 200
         
     except APIException as e:
         db.session.rollback()
@@ -510,13 +660,13 @@ def get_group_members(group_id):
         return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
 # ============================================================================
-# LIVE VOTING SESSION MANAGEMENT
+# 🔧 ENHANCED VOTING SESSION MANAGEMENT WITH STEAM VALIDATION
 # ============================================================================
 
 @gaming.route('/groups/<int:group_id>/start-vote', methods=['POST'])
 @jwt_required()
 def start_group_vote(group_id):
-    """Start a voting session for a group"""
+    """🔧 ENHANCED: Start a voting session with Steam validation"""
     try:
         user = get_current_user()
         
@@ -526,6 +676,45 @@ def start_group_vote(group_id):
         
         if user not in group.members:
             return jsonify({'success': False, 'error': 'Access denied'}), 403
+        
+        # 🔧 NEW: Validate Steam coverage before starting session
+        steam_members = [m for m in group.members if m.is_steam_connected]
+        total_members = len(group.members)
+        
+        if len(steam_members) < 2:
+            return jsonify({
+                'success': False,
+                'error': 'Insufficient Steam coverage',
+                'message': f'Need at least 2 Steam-connected members to start voting. Currently have {len(steam_members)}.',
+                'steam_coverage': {
+                    'connected': len(steam_members),
+                    'total': total_members,
+                    'percentage': (len(steam_members) / total_members * 100) if total_members > 0 else 0
+                },
+                'recommendations': [
+                    'Ask more members to connect their Steam accounts',
+                    'Members should sync their Steam libraries after connecting'
+                ]
+            }), 400
+        
+        # 🔧 NEW: Check for common games
+        common_games = get_group_common_games(group.id)
+        if len(common_games) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'No common games found',
+                'message': 'Steam-connected members have no multiplayer games in common.',
+                'steam_coverage': {
+                    'connected': len(steam_members),
+                    'total': total_members,
+                    'percentage': (len(steam_members) / total_members * 100) if total_members > 0 else 0
+                },
+                'recommendations': [
+                    'Members should sync their Steam libraries',
+                    'Consider purchasing common multiplayer games',
+                    'Check if all Steam libraries are up to date'
+                ]
+            }), 400
         
         # Check if there's already an active session
         active_session = GameSession.query.filter_by(
@@ -573,6 +762,12 @@ def start_group_vote(group_id):
                 'created_at': new_session.created_at.isoformat(),
                 'max_choices': new_session.max_choices,
                 'auto_complete_threshold': new_session.auto_complete_threshold
+            },
+            'steam_readiness': {
+                'connected_members': len(steam_members),
+                'total_members': total_members,
+                'common_games_count': len(common_games),
+                'coverage_percentage': (len(steam_members) / total_members * 100) if total_members > 0 else 0
             },
             'message': 'Voting session created successfully'
         }), 201
@@ -634,7 +829,7 @@ def get_active_session(group_id):
 @gaming.route('/groups/<int:group_id>/common-games', methods=['GET'])
 @jwt_required()
 def get_group_common_games(group_id):
-    """Get common games for a group from synced Steam libraries"""
+    """🔧 ENHANCED: Get common games with Steam status validation"""
     try:
         user = get_current_user()
         
@@ -647,14 +842,24 @@ def get_group_common_games(group_id):
         
         # Get Steam-connected members
         steam_members = [m for m in group.members if (m.steam_connected or m.is_steam_connected) and m.steam_id]
+        total_members = len(group.members)
+        
+        steam_coverage = {
+            'connected': len(steam_members),
+            'total': total_members,
+            'percentage': (len(steam_members) / total_members * 100) if total_members > 0 else 0
+        }
         
         if len(steam_members) < 2:
             return jsonify({
                 'success': True,
                 'games': [],
                 'message': 'Need at least 2 Steam-connected members',
-                'steam_connected_count': len(steam_members),
-                'total_members': len(group.members)
+                'steam_coverage': steam_coverage,
+                'recommendations': [
+                    'More members need to connect Steam',
+                    'At least 2 Steam connections required for game matching'
+                ]
             }), 200
         
         # Get common games using database query with imported user_games table
@@ -683,12 +888,37 @@ def get_group_common_games(group_id):
             game_data['owner_count'] = len(user_ids)
             games.append(game_data)
         
+        # Generate recommendations based on results
+        recommendations = []
+        if len(games) == 0:
+            recommendations.extend([
+                'No common multiplayer games found',
+                'Members should sync their Steam libraries',
+                'Consider purchasing popular multiplayer games together'
+            ])
+        elif len(games) < 5:
+            recommendations.extend([
+                'Limited game selection available',
+                'Consider expanding your game libraries'
+            ])
+        else:
+            recommendations.append('Good game selection available for voting!')
+        
         return jsonify({
             'success': True,
             'games': games,
             'total_games': len(games),
-            'steam_connected_count': len(steam_members),
-            'total_members': len(group.members)
+            'steam_coverage': steam_coverage,
+            'connected_members': [
+                {
+                    'id': m.id,
+                    'username': m.username,
+                    'steam_username': m.steam_username,
+                    'total_games': m.total_games or 0,
+                    'last_synced': m.steam_library_synced_at.isoformat() if m.steam_library_synced_at else None
+                } for m in steam_members
+            ],
+            'recommendations': recommendations
         }), 200
         
     except APIException as e:

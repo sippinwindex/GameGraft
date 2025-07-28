@@ -1,10 +1,13 @@
-// src/front/main.jsx - Enhanced with Lazy Loading and Error Boundaries
+// src/front/main.jsx - FIXED VERSION with correct GlobalStoreProvider
 
 import React, { Suspense } from 'react';
 import { createRoot } from 'react-dom/client';
 import { RouterProvider } from 'react-router-dom';
 import { router } from './routes.jsx';
-import { StoreProvider } from './hooks/useGlobalReducer.jsx';
+
+// 🔥 FIXED: Import the correct GlobalStoreProvider from store.js
+import { GlobalStoreProvider } from './store/store.js';
+
 import { Toaster } from 'react-hot-toast';
 import './index.css';
 import ErrorBoundary from './components/ErrorBoundary.jsx';
@@ -62,7 +65,7 @@ class LazyLoadErrorBoundary extends React.Component {
                     </p>
                     <button
                         onClick={() => window.location.reload()}
-                        className="px-4 py-2 bg-coral-500 hover:bg-coral-600 text-white font-medium rounded-lg text-sm transition-colors"
+                        className="px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg text-sm transition-colors"
                     >
                         Refresh Page
                     </button>
@@ -108,11 +111,11 @@ if (!container._reactRoot) {
     root = container._reactRoot;
 }
 
-// Render the app with enhanced error boundaries and suspense
+// 🔥 FIXED: Render with GlobalStoreProvider instead of StoreProvider
 root.render(
     <React.StrictMode>
         <ErrorBoundary>
-            <StoreProvider>
+            <GlobalStoreProvider>
                 <Suspense fallback={<GlobalSuspenseFallback message="Loading SquadUp..." />}>
                     <RouterProvider 
                         router={router} 
@@ -132,7 +135,7 @@ root.render(
                         }
                     }}
                 />
-            </StoreProvider>
+            </GlobalStoreProvider>
         </ErrorBoundary>
     </React.StrictMode>
 );

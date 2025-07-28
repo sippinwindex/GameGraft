@@ -1,25 +1,25 @@
-// src/front/services/sseManager.js - Enhanced SSE Connection Manager with Stability Patches
+// src/front/services/sseManager.js - FIXED VERSION with proper useSSEManager export
+
 import authService from '../store/authService';
 import { useRef, useState, useEffect } from 'react';
 
 /**
  * Enhanced SSE Manager for reliable real-time connections
  * Handles connection management, reconnection logic, heartbeat monitoring, and error recovery
- * PATCHED: Fixed immediate disconnection issues and improved stability
+ * FIXED: Now properly exports useSSEManager hook that components expect
  */
 class SSEManager {
     constructor(endpoint, options = {}) {
         this.endpoint = endpoint;
-        // PATCH: Updated default options for better stability
         this.options = {
             maxRetries: 5,
-            retryDelay: 3000, // Increased from 2000
-            heartbeatTimeout: 60000, // Increased from 30000
-            reconnectMultiplier: 1.3, // Reduced from 1.5
-            maxReconnectDelay: 45000, // Increased from 30000
+            retryDelay: 3000,
+            heartbeatTimeout: 60000,
+            reconnectMultiplier: 1.3,
+            maxReconnectDelay: 45000,
             enableLogging: true,
             autoReconnect: true,
-            connectionTimeout: 15000, // NEW: connection timeout
+            connectionTimeout: 15000,
             ...options
         };
         
@@ -42,7 +42,7 @@ class SSEManager {
         this.reconnectTimer = null;
         this.heartbeatTimer = null;
         this.healthCheckTimer = null;
-        this.connectionTimeoutTimer = null; // NEW: connection timeout timer
+        this.connectionTimeoutTimer = null;
         
         // Bind methods to preserve context
         this.connect = this.connect.bind(this);
@@ -56,9 +56,6 @@ class SSEManager {
         this.log('SSE Manager initialized', { endpoint, options: this.options });
     }
     
-    /**
-     * PATCH: Enhanced connection method with timeout handling
-     */
     connect() {
         if (this.isDestroyed) {
             this.log('Cannot connect - manager is destroyed', 'warn');
@@ -72,7 +69,6 @@ class SSEManager {
             return;
         }
         
-        // Prevent duplicate connections
         if (this.isConnected || this.isReconnecting) {
             this.log('Connection already active or reconnecting', 'warn');
             return;
@@ -100,7 +96,7 @@ class SSEManager {
             this.eventSource.onmessage = this.handleMessage;
             this.eventSource.onerror = this.handleError;
             
-            // NEW: Add connection timeout
+            // Add connection timeout
             this.connectionTimeoutTimer = setTimeout(() => {
                 if (this.isReconnecting && !this.isConnected) {
                     this.log('Connection timeout reached', 'warn');
@@ -117,9 +113,6 @@ class SSEManager {
         }
     }
     
-    /**
-     * PATCH: More robust handleOpen method
-     */
     handleOpen(event) {
         const connectionTime = Date.now() - this.connectionStartTime;
         
@@ -132,7 +125,6 @@ class SSEManager {
         
         this.clearReconnectTimer();
         
-        // Wait a moment before starting heartbeat monitoring
         setTimeout(() => {
             if (this.isConnected) {
                 this.startHeartbeatMonitor();
@@ -146,18 +138,13 @@ class SSEManager {
             attempt: this.connectionAttempts
         });
         
-        // Process queued messages
         this.processMessageQueue();
     }
     
-    /**
-     * Handle incoming messages
-     */
     handleMessage(event) {
         try {
             this.lastHeartbeat = Date.now();
             
-            // Parse message data
             let data;
             try {
                 data = JSON.parse(event.data);
@@ -202,16 +189,11 @@ class SSEManager {
         }
     }
     
-    /**
-     * PATCH: Less aggressive error handling to fix immediate disconnections
-     */
     handleError(error) {
         this.log('SSE connection error', 'error', error);
         
-        // Check if this is just a temporary network blip
         const timeSinceConnection = Date.now() - (this.connectionStartTime || 0);
         
-        // Don't immediately disconnect if we just connected (might be browser quirk)
         if (timeSinceConnection < 1000) {
             this.log('Ignoring error within 1s of connection (possible browser quirk)', 'warn');
             return;
@@ -235,21 +217,16 @@ class SSEManager {
             timeSinceConnection
         });
         
-        // Only close if the connection is actually broken
         if (this.eventSource && this.eventSource.readyState === EventSource.CLOSED) {
             this.eventSource.close();
             this.eventSource = null;
         }
         
-        // Schedule reconnection if auto-reconnect is enabled
         if (this.options.autoReconnect && !this.isDestroyed) {
             this.scheduleReconnect();
         }
     }
     
-    /**
-     * Handle connection failures
-     */
     handleConnectionFailure(error) {
         this.log('Connection failure', 'error', error);
         
@@ -268,9 +245,6 @@ class SSEManager {
         }
     }
     
-    /**
-     * Gracefully disconnect SSE connection
-     */
     disconnect() {
         this.log('Disconnecting SSE');
         
@@ -290,9 +264,6 @@ class SSEManager {
         });
     }
     
-    /**
-     * Schedule reconnection with exponential backoff
-     */
     scheduleReconnect() {
         if (this.retryCount >= this.options.maxRetries) {
             this.log('Max reconnection attempts reached', 'error');
@@ -306,7 +277,6 @@ class SSEManager {
         
         this.retryCount++;
         
-        // Calculate delay with exponential backoff
         const baseDelay = this.options.retryDelay;
         const multiplier = Math.pow(this.options.reconnectMultiplier, this.retryCount - 1);
         const delay = Math.min(baseDelay * multiplier, this.options.maxReconnectDelay);
@@ -327,20 +297,14 @@ class SSEManager {
         }, delay);
     }
     
-    /**
-     * Start heartbeat monitoring
-     */
     startHeartbeatMonitor() {
         this.stopHeartbeatMonitor();
         
         this.heartbeatTimer = setInterval(() => {
             this.checkHeartbeat();
-        }, 10000); // Check every 10 seconds
+        }, 10000);
     }
     
-    /**
-     * Stop heartbeat monitoring
-     */
     stopHeartbeatMonitor() {
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
@@ -348,15 +312,10 @@ class SSEManager {
         }
     }
     
-    /**
-     * PATCH: More lenient heartbeat checking
-     */
     checkHeartbeat() {
         if (!this.isConnected || !this.lastHeartbeat) return;
         
         const timeSinceHeartbeat = Date.now() - this.lastHeartbeat;
-        
-        // Increased timeout and added warning threshold
         const warningThreshold = this.options.heartbeatTimeout * 0.8;
         
         if (timeSinceHeartbeat > warningThreshold && timeSinceHeartbeat <= this.options.heartbeatTimeout) {
@@ -368,16 +327,12 @@ class SSEManager {
                 timeout: this.options.heartbeatTimeout 
             });
             
-            // Force reconnection only after extended timeout
             if (timeSinceHeartbeat > this.options.heartbeatTimeout * 1.5) {
                 this.handleHeartbeatTimeout();
             }
         }
     }
     
-    /**
-     * Handle heartbeat timeout
-     */
     handleHeartbeatTimeout() {
         this.log('Heartbeat timeout detected, forcing reconnection', 'warn');
         
@@ -388,26 +343,19 @@ class SSEManager {
         }
     }
     
-    /**
-     * Start general health monitoring
-     */
     startHealthMonitoring() {
         this.stopHealthMonitoring();
         
         this.healthCheckTimer = setInterval(() => {
             if (this.isConnected && this.eventSource) {
-                // Check if EventSource is still in a good state
                 if (this.eventSource.readyState === EventSource.CLOSED) {
                     this.log('EventSource closed unexpectedly', 'warn');
                     this.handleError(new Event('unexpected_close'));
                 }
             }
-        }, 30000); // Check every 30 seconds
+        }, 30000);
     }
     
-    /**
-     * Stop health monitoring
-     */
     stopHealthMonitoring() {
         if (this.healthCheckTimer) {
             clearInterval(this.healthCheckTimer);
@@ -415,24 +363,17 @@ class SSEManager {
         }
     }
     
-    /**
-     * PATCH: Updated clearTimers to include connection timeout
-     */
     clearTimers() {
         this.clearReconnectTimer();
         this.stopHeartbeatMonitor();
         this.stopHealthMonitoring();
         
-        // NEW: Clear connection timeout
         if (this.connectionTimeoutTimer) {
             clearTimeout(this.connectionTimeoutTimer);
             this.connectionTimeoutTimer = null;
         }
     }
     
-    /**
-     * Clear reconnection timer
-     */
     clearReconnectTimer() {
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -440,9 +381,7 @@ class SSEManager {
         }
     }
     
-    /**
-     * Add event listener
-     */
+    // Event management methods
     on(event, callback) {
         if (!this.listeners.has(event)) {
             this.listeners.set(event, []);
@@ -452,9 +391,6 @@ class SSEManager {
         return () => this.off(event, callback);
     }
     
-    /**
-     * Remove event listener
-     */
     off(event, callback) {
         if (this.listeners.has(event)) {
             const callbacks = this.listeners.get(event);
@@ -465,9 +401,6 @@ class SSEManager {
         }
     }
     
-    /**
-     * Remove all listeners for an event
-     */
     removeAllListeners(event) {
         if (event) {
             this.listeners.delete(event);
@@ -476,9 +409,6 @@ class SSEManager {
         }
     }
     
-    /**
-     * Emit event to all listeners
-     */
     emit(event, data) {
         if (this.listeners.has(event)) {
             this.listeners.get(event).forEach(callback => {
@@ -491,24 +421,17 @@ class SSEManager {
         }
     }
     
-    /**
-     * Queue message for later processing
-     */
     queueMessage(message) {
         this.messageQueue.push({
             message,
             timestamp: Date.now()
         });
         
-        // Limit queue size
         if (this.messageQueue.length > 100) {
             this.messageQueue.shift();
         }
     }
     
-    /**
-     * Process queued messages
-     */
     processMessageQueue() {
         if (this.messageQueue.length > 0) {
             this.log(`Processing ${this.messageQueue.length} queued messages`);
@@ -521,9 +444,6 @@ class SSEManager {
         }
     }
     
-    /**
-     * Get current connection status and stats
-     */
     getStatus() {
         return {
             isConnected: this.isConnected,
@@ -540,34 +460,22 @@ class SSEManager {
         };
     }
     
-    /**
-     * Get detailed connection stats
-     */
     getStats() {
         return this.getStatus();
     }
     
-    /**
-     * Force reconnection (useful for manual retry)
-     */
     forceReconnect() {
         this.log('Force reconnection requested');
-        this.retryCount = 0; // Reset retry count
+        this.retryCount = 0;
         this.disconnect();
         setTimeout(() => this.connect(), 1000);
     }
     
-    /**
-     * Update connection options
-     */
     updateOptions(newOptions) {
         this.options = { ...this.options, ...newOptions };
         this.log('Options updated', 'info', this.options);
     }
     
-    /**
-     * Destroy the manager (no more connections)
-     */
     destroy() {
         this.log('Destroying SSE Manager');
         
@@ -580,9 +488,6 @@ class SSEManager {
         this.emit('destroyed');
     }
     
-    /**
-     * Enhanced logging
-     */
     log(message, level = 'info', data = null) {
         if (!this.options.enableLogging) return;
         
@@ -613,7 +518,7 @@ export function createSSEManager(endpoint, options = {}) {
     return new SSEManager(endpoint, options);
 }
 
-// Hook for React components
+// 🔥 FIXED: Hook for React components that your code expects
 export function useSSEManager(endpoint, options = {}) {
     const managerRef = useRef(null);
     const [status, setStatus] = useState({
