@@ -1,665 +1,516 @@
-// src/front/hooks/useLiveVoting.js - PHASE 4 SSE INTEGRATION WITH YOUR EXISTING COMPONENTS
-// 🚀 Works with your LiveVotingSession.jsx, VotingStatusPanel.jsx, and VotingReminders.jsx
+// src/front/hooks/useLiveVoting.js - ENHANCED Live Voting Hook
+// Addresses Phase 2 priorities: comprehensive live voting with real-time updates
 
-import { useEffect, useRef, useCallback } from 'react';
-import { useGlobalReducer, ACTION_TYPES, selectors, votingHelpers } from '../store/store.js';
-import { useSSEManager } from '../services/sseManager.js';
-import authService from '../store/authService.js';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useGlobalReducer } from '../store/store.js';
+import authService from '../store/authService';
+import { apiUrl } from '../config/environment.js';
 
 /**
- * 🚀 Phase 4: Enhanced Live Voting Hook
- * Integrates with your existing SSE components and beautiful UI
+ * Enhanced Live Voting Hook with Kahoot-style real-time features
+ * Implements comprehensive voting session lifecycle management
  */
 export const useLiveVoting = (sessionId, options = {}) => {
-    const { store, dispatch } = useGlobalReducer();
-    const reconnectAttempts = useRef(0);
-    const maxReconnectAttempts = 10;
-
-    // Options with defaults
     const {
-        onAllVotesComplete = null,
-        onVoteUpdate = null,
-        onMemberUpdate = null,
-        onError = null,
+        onAllVotesComplete,
+        onVoteUpdate,
+        onMemberUpdate,
+        onError,
         enableAutoReconnect = true,
-        autoNavigateOnComplete = false
+        autoNavigateOnComplete = false,
+        heartbeatInterval = 30000,
+        maxReconnectAttempts = 5
     } = options;
 
-    // 🚀 Get voting state from optimized store selectors
-    const isVotingActive = selectors.selectIsVotingActive(store);
-    const votingMembers = selectors.selectVotingMembers(store);
-    const votedUsers = selectors.selectVotedUsers(store);
-    const pendingUsers = selectors.selectPendingUsers(store);
-    const allVotesComplete = selectors.selectAllVotesComplete(store);
-    const votingProgress = selectors.selectVotingProgress(store);
-    const currentVoter = selectors.selectCurrentVoter(store);
-    const sessionStatus = selectors.selectSessionStatus(store);
-    const votingError = selectors.selectVotingError(store);
-
-    // Get backend URL
-    const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
-
-    // 🚀 SSE Manager for reliable connections (using your existing sseManager)
-    const sseEndpoint = sessionId ? `/api/live-voting/sessions/${sessionId}/live-stream` : null;
-    const { manager, status } = useSSEManager(sseEndpoint, {
-        enableLogging: true,
-        autoReconnect: enableAutoReconnect,
-        maxReconnectAttempts,
-        reconnectDelay: 1000
+    const { store, dispatch } = useGlobalReducer();
+    
+    // Core voting state
+    const [votingState, setVotingState] = useState({
+        isActive: false,
+        isConnected: false,
+        isReconnecting: false,
+        members: [],
+        votedUsers: [],
+        pendingUsers: [],
+        allVotesComplete: false,
+        progress: 0,
+        sessionData: null,
+        error: null,
+        lastUpdate: null
     });
 
-    // 🚀 Enhanced SSE Event Handlers (optimized for your components)
-    const handleVotingUpdate = useCallback((data) => {
-        console.log('🔥 SSE: Live voting update received:', data);
+    // Connection management
+    const [connectionState, setConnectionState] = useState({
+        attempts: 0,
+        lastConnected: null,
+        reconnectTimeout: null
+    });
+
+    // Refs for cleanup and persistence
+    const eventSourceRef = useRef(null);
+    const heartbeatRef = useRef(null);
+    const reconnectTimeoutRef = useRef(null);
+    const voteAggregationRef = useRef(new Map());
+
+    // 🎯 ENHANCED: Real-time vote aggregation with conflict resolution
+    const aggregateVotes = useCallback((voteData) => {
+        const { userId, votes, timestamp, sessionId: voteSessionId } = voteData;
         
-        try {
-            switch (data.type) {
-                case 'voting_session_started':
-                    console.log('🚀 SSE: Voting session started');
-                    votingHelpers.startVotingSession(dispatch, {
-                        sessionId: data.sessionId,
-                        members: data.members,
-                        gameTitle: data.gameTitle,
-                        initiatedBy: data.initiatedBy
-                    });
-                    break;
+        // Validate vote data
+        if (!userId || !votes || voteSessionId !== sessionId) {
+            console.warn('🚫 Invalid vote data received:', voteData);
+            return false;
+        }
 
-                case 'user_vote_submitted':
-                    console.log('✅ SSE: User voted:', data.userId);
-                    votingHelpers.handleVoteUpdate(dispatch, {
-                        userId: data.userId,
-                        action: 'voted',
-                        voteData: data.voteData,
-                        timestamp: data.timestamp
-                    });
-                    
-                    // Trigger custom callback
-                    if (onVoteUpdate) {
-                        onVoteUpdate({
-                            userId: data.userId,
-                            status: 'voted',
-                            voteData: data.voteData
-                        });
-                    }
-                    break;
+        const aggregationMap = voteAggregationRef.current;
+        const existingVote = aggregationMap.get(userId);
+        
+        // Conflict resolution: later timestamp wins
+        if (existingVote && new Date(existingVote.timestamp) > new Date(timestamp)) {
+            console.log('🔄 Ignoring older vote from user:', userId);
+            return false;
+        }
 
-                case 'user_status_pending':
-                    console.log('⏳ SSE: User pending:', data.userId);
-                    votingHelpers.handleVoteUpdate(dispatch, {
-                        userId: data.userId,
-                        action: 'pending',
-                        reason: data.reason
-                    });
-                    break;
+        // Store the vote with metadata
+        aggregationMap.set(userId, {
+            userId,
+            votes,
+            timestamp,
+            processed: true,
+            conflicts: existingVote ? (existingVote.conflicts || 0) + 1 : 0
+        });
 
-                case 'user_currently_voting':
-                    console.log('🎯 SSE: User currently voting:', data.userId);
-                    dispatch({
-                        type: ACTION_TYPES.SET_CURRENT_VOTER,
-                        payload: {
-                            userId: data.userId,
-                            startTime: data.startTime,
-                            timeLimit: data.timeLimit
-                        }
-                    });
-                    break;
+        return true;
+    }, [sessionId]);
 
-                case 'voting_session_complete':
-                    console.log('🎉 SSE: All votes complete!');
-                    dispatch({
-                        type: ACTION_TYPES.ALL_VOTES_COMPLETE,
-                        payload: {
-                            completed: true,
-                            results: data.results,
-                            completedAt: data.completedAt
-                        }
-                    });
-                    
-                    // Enhanced completion callback with results
-                    if (onAllVotesComplete) {
-                        setTimeout(() => onAllVotesComplete({
-                            sessionId: data.sessionId,
-                            results: data.results,
-                            completedAt: data.completedAt,
-                            autoNavigate: autoNavigateOnComplete
-                        }), 1500); // Delay for visual feedback
-                    }
-                    break;
+    // 🎯 ENHANCED: Kahoot-style member status tracking
+    const updateMemberStatus = useCallback((members, votedUserIds) => {
+        const updatedMembers = members.map(member => {
+            const hasVoted = votedUserIds.includes(member.id);
+            const voteData = voteAggregationRef.current.get(member.id);
+            
+            return {
+                ...member,
+                hasVoted,
+                status: hasVoted ? 'voted' : 'pending',
+                voteTime: voteData?.timestamp || null,
+                voteCount: voteData?.votes?.length || 0,
+                conflicts: voteData?.conflicts || 0
+            };
+        });
 
-                case 'voting_session_ended':
-                    console.log('🏁 SSE: Voting session ended');
-                    votingHelpers.endVotingSession(dispatch, {
-                        reason: data.reason,
-                        endedBy: data.endedBy
-                    });
-                    break;
+        const votedCount = votedUserIds.length;
+        const totalCount = members.length;
+        const progress = totalCount > 0 ? (votedCount / totalCount) * 100 : 0;
+        const allComplete = progress >= 100;
 
-                case 'member_joined_session':
-                    console.log('👥 SSE: New member joined voting');
-                    dispatch({
-                        type: ACTION_TYPES.UPDATE_VOTING_MEMBERS,
-                        payload: {
-                            members: data.members,
-                            newMember: data.newMember
-                        }
-                    });
-                    
-                    if (onMemberUpdate) {
-                        onMemberUpdate({
-                            action: 'joined',
-                            member: data.newMember,
-                            members: data.members
-                        });
-                    }
-                    break;
+        setVotingState(prev => ({
+            ...prev,
+            members: updatedMembers,
+            votedUsers: updatedMembers.filter(m => m.hasVoted),
+            pendingUsers: updatedMembers.filter(m => !m.hasVoted),
+            progress,
+            allVotesComplete: allComplete,
+            lastUpdate: new Date().toISOString()
+        }));
 
-                case 'member_left_session':
-                    console.log('👋 SSE: Member left voting');
-                    dispatch({
-                        type: ACTION_TYPES.UPDATE_VOTING_MEMBERS,
-                        payload: {
-                            members: data.members,
-                            leftMember: data.leftMember
-                        }
-                    });
-                    
-                    if (onMemberUpdate) {
-                        onMemberUpdate({
-                            action: 'left',
-                            member: data.leftMember,
-                            members: data.members
-                        });
-                    }
-                    break;
-
-                case 'voting_reminder_sent':
-                    console.log('🔔 SSE: Reminder sent to users');
-                    dispatch({
-                        type: ACTION_TYPES.VOTING_REMINDER_SENT,
-                        payload: {
-                            reminderType: data.reminderType,
-                            sentTo: data.sentTo,
-                            timestamp: data.timestamp
-                        }
-                    });
-                    break;
-
-                case 'voting_time_warning':
-                    console.log('⏰ SSE: Time warning');
-                    dispatch({
-                        type: ACTION_TYPES.VOTING_TIME_WARNING,
-                        payload: {
-                            timeRemaining: data.timeRemaining,
-                            warningType: data.warningType
-                        }
-                    });
-                    break;
-
-                case 'voting_error':
-                    console.error('❌ SSE: Voting error:', data.error);
-                    dispatch({
-                        type: ACTION_TYPES.SET_VOTING_ERROR,
-                        payload: {
-                            error: data.error,
-                            code: data.code,
-                            timestamp: data.timestamp
-                        }
-                    });
-                    
-                    if (onError) {
-                        onError({
-                            error: data.error,
-                            code: data.code,
-                            timestamp: data.timestamp
-                        });
-                    }
-                    break;
-
-                default:
-                    console.log('🔄 SSE: Unknown voting event:', data.type, data);
-            }
-        } catch (error) {
-            console.error('❌ SSE: Error handling voting update:', error);
-            dispatch({
-                type: ACTION_TYPES.SET_VOTING_ERROR,
-                payload: {
-                    error: 'Failed to process live update',
-                    details: error.message,
-                    timestamp: new Date().toISOString()
-                }
+        // Trigger completion callback
+        if (allComplete && !votingState.allVotesComplete) {
+            console.log('🎉 All votes complete!');
+            onAllVotesComplete?.({
+                results: Array.from(voteAggregationRef.current.values()),
+                completedAt: new Date().toISOString(),
+                autoNavigate: autoNavigateOnComplete,
+                totalVotes: votedCount,
+                conflicts: Array.from(voteAggregationRef.current.values())
+                    .reduce((sum, vote) => sum + (vote.conflicts || 0), 0)
             });
         }
-    }, [dispatch, onAllVotesComplete, onVoteUpdate, onMemberUpdate, onError, autoNavigateOnComplete]);
 
-    // 🚀 Enhanced SSE Event Listeners
-    useEffect(() => {
-        if (!manager || !sessionId) return;
+        return { updatedMembers, progress, allComplete };
+    }, [votingState.allVotesComplete, onAllVotesComplete, autoNavigateOnComplete]);
 
-        console.log('🔌 SSE: Setting up live voting listeners for session:', sessionId);
+    // 🎯 ENHANCED: SSE Connection with comprehensive error handling
+    const connectToVotingStream = useCallback(() => {
+        if (!sessionId || eventSourceRef.current) return;
 
-        // Main voting events
-        manager.addEventListener('voting_update', handleVotingUpdate);
-        manager.addEventListener('session_update', handleVotingUpdate);
-        manager.addEventListener('member_update', handleVotingUpdate);
-        manager.addEventListener('error', (event) => {
-            console.error('❌ SSE: Connection error:', event);
-            dispatch({
-                type: ACTION_TYPES.SET_VOTING_ERROR,
-                payload: {
-                    error: 'Connection error',
-                    details: event.data?.message || 'SSE connection failed',
-                    timestamp: new Date().toISOString()
+        const token = authService.getAccessToken();
+        if (!token) {
+            setVotingState(prev => ({ ...prev, error: { error: 'Authentication required', code: 'AUTH_REQUIRED' } }));
+            return;
+        }
+
+        console.log(`🔗 Connecting to live voting stream for session: ${sessionId}`);
+        
+        const url = `${apiUrl}/api/live-voting/sessions/${sessionId}/live-stream?token=${encodeURIComponent(token)}`;
+        const eventSource = new EventSource(url);
+        eventSourceRef.current = eventSource;
+
+        // Connection opened
+        eventSource.onopen = () => {
+            console.log('✅ Live voting stream connected');
+            setVotingState(prev => ({
+                ...prev,
+                isConnected: true,
+                isReconnecting: false,
+                error: null
+            }));
+            setConnectionState(prev => ({
+                ...prev,
+                attempts: 0,
+                lastConnected: new Date().toISOString()
+            }));
+
+            // Start heartbeat monitoring
+            if (heartbeatInterval > 0) {
+                heartbeatRef.current = setInterval(() => {
+                    // Send ping or check connection health
+                    console.log('💓 Voting stream heartbeat check');
+                }, heartbeatInterval);
+            }
+        };
+
+        // Message received
+        eventSource.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                console.log('📡 Live voting message:', data.type, data);
+
+                switch (data.type) {
+                    case 'heartbeat':
+                        // Update last seen heartbeat
+                        setVotingState(prev => ({ ...prev, lastUpdate: new Date().toISOString() }));
+                        break;
+
+                    case 'session_started':
+                    case 'voting_started':
+                        console.log('🚀 Voting session started');
+                        setVotingState(prev => ({
+                            ...prev,
+                            isActive: true,
+                            sessionData: data.session || data,
+                            members: data.members || prev.members
+                        }));
+                        // Clear previous vote aggregation
+                        voteAggregationRef.current.clear();
+                        break;
+
+                    case 'vote_submitted':
+                    case 'vote_update':
+                        console.log('🗳️ Vote received from user:', data.user_id || data.userId);
+                        
+                        // Aggregate the vote with conflict resolution
+                        const voteAccepted = aggregateVotes({
+                            userId: data.user_id || data.userId,
+                            votes: data.votes || data.game_votes,
+                            timestamp: data.timestamp || new Date().toISOString(),
+                            sessionId: data.session_id || sessionId
+                        });
+
+                        if (voteAccepted) {
+                            // Update member statuses
+                            const votedUserIds = Array.from(voteAggregationRef.current.keys());
+                            updateMemberStatus(votingState.members, votedUserIds);
+                            
+                            // Notify parent components
+                            onVoteUpdate?.({
+                                userId: data.user_id || data.userId,
+                                votes: data.votes || data.game_votes,
+                                timestamp: data.timestamp,
+                                status: 'voted'
+                            });
+                        }
+                        break;
+
+                    case 'member_joined':
+                    case 'member_left':
+                        console.log('👥 Member update:', data.type, data.username);
+                        
+                        if (data.type === 'member_joined') {
+                            setVotingState(prev => ({
+                                ...prev,
+                                members: [...prev.members, {
+                                    id: data.user_id || data.userId,
+                                    username: data.username,
+                                    avatar_url: data.avatar_url,
+                                    hasVoted: false,
+                                    status: 'pending'
+                                }]
+                            }));
+                        } else {
+                            setVotingState(prev => ({
+                                ...prev,
+                                members: prev.members.filter(m => m.id !== (data.user_id || data.userId))
+                            }));
+                        }
+
+                        onMemberUpdate?.({
+                            action: data.type === 'member_joined' ? 'joined' : 'left',
+                            userId: data.user_id || data.userId,
+                            username: data.username,
+                            members: votingState.members
+                        });
+                        break;
+
+                    case 'voting_completed':
+                    case 'session_ended':
+                        console.log('🏁 Voting session completed');
+                        setVotingState(prev => ({
+                            ...prev,
+                            isActive: false,
+                            allVotesComplete: true
+                        }));
+
+                        onAllVotesComplete?.({
+                            results: data.results || Array.from(voteAggregationRef.current.values()),
+                            completedAt: data.completed_at || new Date().toISOString(),
+                            autoNavigate: autoNavigateOnComplete,
+                            finalResults: data.final_results,
+                            winner: data.winner
+                        });
+                        break;
+
+                    case 'error':
+                        console.error('❌ Voting stream error:', data.error);
+                        setVotingState(prev => ({
+                            ...prev,
+                            error: {
+                                error: data.error,
+                                code: data.code || 'STREAM_ERROR',
+                                details: data.details
+                            }
+                        }));
+                        onError?.(data);
+                        break;
+
+                    default:
+                        console.log('🔍 Unknown voting message type:', data.type);
                 }
-            });
-        });
+            } catch (parseError) {
+                console.error('❌ Failed to parse voting stream message:', parseError);
+                setVotingState(prev => ({
+                    ...prev,
+                    error: {
+                        error: 'Message parsing failed',
+                        code: 'PARSE_ERROR',
+                        details: parseError.message
+                    }
+                }));
+            }
+        };
 
-        // Connection status events
-        manager.addEventListener('connected', () => {
-            console.log('✅ SSE: Connected to live voting');
-            reconnectAttempts.current = 0;
-            dispatch({
-                type: ACTION_TYPES.SET_VOTING_CONNECTION_STATUS,
-                payload: 'connected'
-            });
-        });
+        // Connection error
+        eventSource.onerror = (error) => {
+            console.error('❌ Live voting stream error:', error);
+            setVotingState(prev => ({
+                ...prev,
+                isConnected: false,
+                error: {
+                    error: 'Connection lost',
+                    code: 'CONNECTION_ERROR',
+                    details: 'SSE connection failed'
+                }
+            }));
 
-        manager.addEventListener('disconnected', () => {
-            console.log('🔌 SSE: Disconnected from live voting');
-            dispatch({
-                type: ACTION_TYPES.SET_VOTING_CONNECTION_STATUS,
-                payload: 'disconnected'
-            });
-        });
+            // Attempt reconnection if enabled
+            if (enableAutoReconnect && connectionState.attempts < maxReconnectAttempts) {
+                setConnectionState(prev => ({ ...prev, attempts: prev.attempts + 1 }));
+                setVotingState(prev => ({ ...prev, isReconnecting: true }));
+                
+                const delay = Math.min(1000 * Math.pow(2, connectionState.attempts), 30000);
+                console.log(`🔄 Reconnecting in ${delay}ms (attempt ${connectionState.attempts + 1})`);
+                
+                reconnectTimeoutRef.current = setTimeout(() => {
+                    disconnect();
+                    connectToVotingStream();
+                }, delay);
+            }
+        };
 
-        manager.addEventListener('reconnecting', (event) => {
-            console.log('🔄 SSE: Reconnecting...', event.data);
-            dispatch({
-                type: ACTION_TYPES.SET_VOTING_CONNECTION_STATUS,
-                payload: 'reconnecting'
-            });
-        });
+    }, [sessionId, enableAutoReconnect, connectionState.attempts, maxReconnectAttempts, heartbeatInterval, updateMemberStatus, onVoteUpdate, onMemberUpdate, onAllVotesComplete, onError, autoNavigateOnComplete, aggregateVotes, votingState.members]);
+
+    // Disconnect from stream
+    const disconnect = useCallback(() => {
+        console.log('🔌 Disconnecting from live voting stream');
+        
+        if (eventSourceRef.current) {
+            eventSourceRef.current.close();
+            eventSourceRef.current = null;
+        }
+
+        if (heartbeatRef.current) {
+            clearInterval(heartbeatRef.current);
+            heartbeatRef.current = null;
+        }
+
+        if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = null;
+        }
+
+        setVotingState(prev => ({
+            ...prev,
+            isConnected: false,
+            isReconnecting: false
+        }));
+    }, []);
+
+    // 🎯 NEW: Start voting session
+    const startVotingSession = useCallback((members, sessionConfig = {}) => {
+        console.log('🚀 Starting voting session with members:', members.length);
+        
+        setVotingState(prev => ({
+            ...prev,
+            isActive: true,
+            members: members.map(member => ({
+                ...member,
+                hasVoted: false,
+                status: 'pending',
+                voteTime: null,
+                voteCount: 0
+            })),
+            sessionData: sessionConfig,
+            votedUsers: [],
+            pendingUsers: members,
+            progress: 0,
+            allVotesComplete: false,
+            error: null
+        }));
+
+        // Clear vote aggregation
+        voteAggregationRef.current.clear();
+
+        // Connect to stream if not already connected
+        if (!votingState.isConnected) {
+            connectToVotingStream();
+        }
+    }, [votingState.isConnected, connectToVotingStream]);
+
+    // 🎯 NEW: End voting session
+    const endVotingSession = useCallback((reason = 'manual') => {
+        console.log(`🏁 Ending voting session: ${reason}`);
+        
+        setVotingState(prev => ({
+            ...prev,
+            isActive: false,
+            allVotesComplete: true
+        }));
+
+        // Keep connection open for result streaming
+        // disconnect(); // Uncomment if you want to close connection immediately
+    }, []);
+
+    // 🎯 NEW: Manual vote submission (for testing or manual entry)
+    const submitVote = useCallback(async (userId, votes) => {
+        try {
+            const voteData = {
+                userId,
+                votes,
+                timestamp: new Date().toISOString(),
+                sessionId
+            };
+
+            // Add to local aggregation immediately for responsiveness
+            const accepted = aggregateVotes(voteData);
+            
+            if (accepted) {
+                const votedUserIds = Array.from(voteAggregationRef.current.keys());
+                updateMemberStatus(votingState.members, votedUserIds);
+            }
+
+            return { success: true, accepted };
+        } catch (error) {
+            console.error('❌ Manual vote submission failed:', error);
+            return { success: false, error: error.message };
+        }
+    }, [sessionId, aggregateVotes, updateMemberStatus, votingState.members]);
+
+    // Initialize connection on mount
+    useEffect(() => {
+        if (sessionId) {
+            connectToVotingStream();
+        }
 
         return () => {
-            console.log('🧹 SSE: Cleaning up live voting listeners');
-            manager.removeAllEventListeners();
+            disconnect();
         };
-    }, [manager, sessionId, handleVotingUpdate, dispatch]);
+    }, [sessionId, connectToVotingStream, disconnect]);
 
-    // 🚀 Helper functions for your existing components
-    const startVotingSession = useCallback(async (members, gameData) => {
-        try {
-            console.log('🚀 Starting voting session:', { sessionId, members, gameData });
-            
-            const currentUser = authService.getCurrentUser();
-            const response = await fetch(`${backendUrl}/api/live-voting/sessions/${sessionId}/start`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${currentUser?.token}`
-                },
-                body: JSON.stringify({
-                    sessionId,
-                    members,
-                    gameData,
-                    initiatedBy: currentUser?.id
-                })
-            });
-
-            if (!response.ok) {
-                throw new Error(`Failed to start voting session: ${response.statusText}`);
-            }
-
-            const result = await response.json();
-            console.log('✅ Voting session started:', result);
-            
-            return result;
-        } catch (error) {
-            console.error('❌ Failed to start voting session:', error);
-            dispatch({
-                type: ACTION_TYPES.SET_VOTING_ERROR,
-                payload: {
-                    error: 'Failed to start voting session',
-                    details: error.message,
-                    timestamp: new Date().toISOString()
-                }
-            });
-            throw error;
-        }
-    }, [dispatch, sessionId, backendUrl]);
-
-    const endVotingSession = useCallback(async (reason = 'manual') => {
-        try {
-            console.log('🏁 Ending voting session:', sessionId);
-            
-            const currentUser = authService.getCurrentUser();
-            const response = await fetch(`${backendUrl}/api/live-voting/sessions/${sessionId}/end`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${currentUser?.token}`
-                },
-                body: JSON.stringify({
-                    sessionId,
-                    reason,
-                    endedBy: currentUser?.id
-                })
-            });
-
-            if (!response.ok) {
-                throw new Error(`Failed to end voting session: ${response.statusText}`);
-            }
-
-            votingHelpers.endVotingSession(dispatch, { reason, endedBy: currentUser?.id });
-            
-            // Disconnect SSE
-            if (manager) {
-                manager.disconnect();
-            }
-
-            console.log('✅ Voting session ended');
-        } catch (error) {
-            console.error('❌ Failed to end voting session:', error);
-            dispatch({
-                type: ACTION_TYPES.SET_VOTING_ERROR,
-                payload: {
-                    error: 'Failed to end voting session',
-                    details: error.message,
-                    timestamp: new Date().toISOString()
-                }
-            });
-        }
-    }, [dispatch, sessionId, backendUrl, manager]);
-
-    const sendVotingReminder = useCallback(async (reminderType = 'gentle') => {
-        try {
-            const currentUser = authService.getCurrentUser();
-            const response = await fetch(`${backendUrl}/api/live-voting/sessions/${sessionId}/remind`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${currentUser?.token}`
-                },
-                body: JSON.stringify({
-                    sessionId,
-                    reminderType,
-                    sentBy: currentUser?.id
-                })
-            });
-
-            if (!response.ok) {
-                throw new Error(`Failed to send reminder: ${response.statusText}`);
-            }
-
-            console.log('🔔 Voting reminder sent');
-            return await response.json();
-        } catch (error) {
-            console.error('❌ Failed to send reminder:', error);
-            throw error;
-        }
-    }, [sessionId, backendUrl]);
-
-    // 🚀 Derived state for your components
-    const votingStatus = {
-        // Core status
-        isActive: isVotingActive,
-        sessionId: selectors.selectVotingSession(store),
-        status: sessionStatus,
-        error: votingError,
-        
-        // Member data
-        members: votingMembers,
-        votedUsers,
-        pendingUsers,
-        currentVoter,
-        
-        // Progress data
-        allVotesComplete,
-        progress: votingProgress,
-        votedCount: votedUsers.length,
-        pendingCount: pendingUsers.length,
-        totalCount: votingMembers.length,
-        
-        // Connection status
-        connectionStatus: status,
-        isConnected: status === 'connected',
-        isReconnecting: status === 'reconnecting'
-    };
-
-    // 🚀 Utility functions for your components
-    const utilities = {
-        isUserVoted: (userId) => votedUsers.some(user => user.id === userId),
-        isUserPending: (userId) => pendingUsers.some(user => user.id === userId),
-        isUserCurrentVoter: (userId) => currentVoter?.userId === userId,
+    // 🎯 ENHANCED: Computed values and helpers
+    const computedValues = {
+        // User status helpers
+        isUserVoted: (userId) => voteAggregationRef.current.has(userId),
+        isUserCurrentVoter: (userId) => votingState.pendingUsers.some(u => u.id === userId),
         getUserStatus: (userId) => {
-            if (votedUsers.some(user => user.id === userId)) return 'voted';
-            if (currentVoter?.userId === userId) return 'voting';
-            if (pendingUsers.some(user => user.id === userId)) return 'pending';
-            return 'waiting';
+            if (voteAggregationRef.current.has(userId)) return 'voted';
+            return votingState.isActive ? 'pending' : 'waiting';
         },
+        
+        // Member status helpers
         getMemberStatusIcon: (userId) => {
-            const status = utilities.getUserStatus(userId);
+            const status = computedValues.getUserStatus(userId);
             switch (status) {
                 case 'voted': return '✅';
-                case 'voting': return '🎯';
                 case 'pending': return '⏳';
-                default: return '⚪';
+                default: return '⭕';
             }
         },
         getMemberStatusColor: (userId) => {
-            const status = utilities.getUserStatus(userId);
+            const status = computedValues.getUserStatus(userId);
             switch (status) {
-                case 'voted': return 'text-neon-green';
-                case 'voting': return 'text-neon-cyan';
-                case 'pending': return 'text-neon-yellow';
-                default: return 'text-gray-400';
+                case 'voted': return 'text-green-400 bg-green-500/20 border-green-500';
+                case 'pending': return 'text-yellow-400 bg-yellow-500/20 border-yellow-500';
+                default: return 'text-gray-400 bg-gray-500/20 border-gray-500';
             }
         },
-        getProgressPercentage: () => {
-            if (votingMembers.length === 0) return 0;
-            return Math.round((votedUsers.length / votingMembers.length) * 100);
-        }
+
+        // Progress helpers
+        getProgressPercentage: () => Math.round(votingState.progress),
+        votedCount: votingState.votedUsers.length,
+        totalCount: votingState.members.length,
+        pendingCount: votingState.pendingUsers.length,
+
+        // Vote data helpers
+        getVoteConflicts: () => Array.from(voteAggregationRef.current.values())
+            .reduce((sum, vote) => sum + (vote.conflicts || 0), 0),
+        getAllVotes: () => Array.from(voteAggregationRef.current.values()),
+        getVoteByUser: (userId) => voteAggregationRef.current.get(userId)
     };
 
+    // Return comprehensive hook interface
     return {
-        // Status and data
-        ...votingStatus,
+        // Core state
+        ...votingState,
         
-        // Actions
+        // Connection management
+        connectionState,
+        reconnect: connectToVotingStream,
+        disconnect,
+        
+        // Session control
         startVotingSession,
         endVotingSession,
-        sendVotingReminder,
-        reconnect: manager?.connect,
-        disconnect: manager?.disconnect,
+        submitVote,
         
-        // Utilities
-        ...utilities
-    };
-};
-
-// 🚀 ENHANCED LIVE VOTING STATUS COMPONENT (for your existing LiveVotingSession.jsx)
-export const LiveVotingStatusPanel = ({ 
-    sessionId, 
-    currentUser, 
-    onNavigateToResults,
-    className = "",
-    showReminders = true,
-    showProgress = true 
-}) => {
-    const voting = useLiveVoting(sessionId, {
-        onAllVotesComplete: (data) => {
-            if (onNavigateToResults) {
-                onNavigateToResults(data);
+        // Computed values and helpers
+        ...computedValues,
+        
+        // Aggregated vote data
+        voteAggregation: voteAggregationRef.current,
+        
+        // Debugging (dev only)
+        ...(process.env.NODE_ENV === 'development' && {
+            debug: {
+                clearVotes: () => voteAggregationRef.current.clear(),
+                simulateVote: (userId, votes) => submitVote(userId, votes),
+                getInternalState: () => ({
+                    aggregation: Array.from(voteAggregationRef.current.entries()),
+                    connectionAttempts: connectionState.attempts,
+                    lastUpdate: votingState.lastUpdate
+                })
             }
-        },
-        autoNavigateOnComplete: true
-    });
-
-    if (!voting.isActive) {
-        return null;
-    }
-
-    return (
-        <div className={`glass-gaming rounded-3xl p-6 mb-6 ${className}`}>
-            {/* Header with connection status */}
-            <div className="flex items-center justify-between mb-6">
-                <h3 className="text-xl font-bold text-white text-shadow-glow">
-                    🎮 Live Voting Session
-                </h3>
-                <div className="flex items-center space-x-3">
-                    <div className={`w-3 h-3 rounded-full ${
-                        voting.isConnected ? 'bg-neon-green animate-glow-pulse' : 
-                        voting.isReconnecting ? 'bg-neon-yellow animate-pulse' : 
-                        'bg-red-500'
-                    }`}></div>
-                    <span className={`text-sm font-medium ${
-                        voting.isConnected ? 'text-neon-green' : 
-                        voting.isReconnecting ? 'text-neon-yellow' : 
-                        'text-red-400'
-                    }`}>
-                        {voting.isConnected ? 'Live' : 
-                         voting.isReconnecting ? 'Reconnecting...' : 
-                         'Disconnected'}
-                    </span>
-                </div>
-            </div>
-
-            {/* Enhanced Progress Bar */}
-            {showProgress && (
-                <div className="mb-6">
-                    <div className="flex justify-between text-sm text-neon-cyan mb-2">
-                        <span className="font-medium">Voting Progress</span>
-                        <span className="text-shadow-glow">
-                            {voting.votedCount} / {voting.totalCount} completed ({voting.getProgressPercentage()}%)
-                        </span>
-                    </div>
-                    <div className="w-full bg-discord-800 rounded-full h-3 overflow-hidden">
-                        <div 
-                            className="bg-gradient-to-r from-neon-cyan to-neon-purple h-3 rounded-full transition-all duration-500 ease-out animate-shimmer"
-                            style={{ width: `${voting.progress}%` }}
-                        ></div>
-                    </div>
-                </div>
-            )}
-
-            {/* Enhanced Members Status Grid */}
-            <div className="space-y-4">
-                <h4 className="text-lg font-semibold text-neon-cyan text-shadow-glow">
-                    👥 Member Status
-                </h4>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {voting.members.map((member, index) => {
-                        const status = voting.getUserStatus(member.id);
-                        const isCurrentUser = member.id === currentUser?.id;
-                        const statusIcon = voting.getMemberStatusIcon(member.id);
-                        const statusColor = voting.getMemberStatusColor(member.id);
-                        
-                        return (
-                            <div 
-                                key={member.id}
-                                className={`glass-effect rounded-xl p-4 transition-all duration-300 animate-fade-in magnetic ${
-                                    isCurrentUser ? 'ring-2 ring-neon-cyan' : ''
-                                }`}
-                                style={{ animationDelay: `${index * 0.1}s` }}
-                            >
-                                <div className="flex items-center justify-between">
-                                    <div className="flex items-center space-x-3">
-                                        <div className="w-8 h-8 rounded-full bg-gradient-to-r from-discord-600 to-discord-700 flex items-center justify-center text-sm font-bold">
-                                            {member.username.charAt(0).toUpperCase()}
-                                        </div>
-                                        <div>
-                                            <span className={`font-medium ${isCurrentUser ? 'text-neon-cyan' : 'text-white'}`}>
-                                                {member.username}
-                                            </span>
-                                            {isCurrentUser && (
-                                                <span className="text-xs text-neon-cyan ml-2">(You)</span>
-                                            )}
-                                        </div>
-                                    </div>
-                                    <div className="flex items-center space-x-2">
-                                        <span className="text-lg">{statusIcon}</span>
-                                        <span className={`px-3 py-1 rounded-full text-xs font-bold border ${statusColor} ${
-                                            status === 'voted' ? 'bg-neon-green/20 border-neon-green' :
-                                            status === 'voting' ? 'bg-neon-cyan/20 border-neon-cyan animate-glow-pulse' :
-                                            status === 'pending' ? 'bg-neon-yellow/20 border-neon-yellow' :
-                                            'bg-gray-600/20 border-gray-500'
-                                        }`}>
-                                            {status === 'voted' ? 'VOTED' :
-                                             status === 'voting' ? 'VOTING...' :
-                                             status === 'pending' ? 'PENDING' :
-                                             'WAITING'}
-                                        </span>
-                                    </div>
-                                </div>
-                            </div>
-                        );
-                    })}
-                </div>
-            </div>
-
-            {/* All Votes Complete Celebration */}
-            {voting.allVotesComplete && (
-                <div className="mt-6 glass-gaming rounded-2xl p-6 border-2 border-neon-green animate-glow-pulse">
-                    <div className="flex items-center justify-center space-x-4">
-                        <span className="text-4xl animate-bounce">🎉</span>
-                        <div className="text-center">
-                            <h4 className="text-xl font-bold text-neon-green text-shadow-glow">
-                                All Votes Complete!
-                            </h4>
-                            <p className="text-neon-cyan">
-                                Navigating to results...
-                            </p>
-                        </div>
-                        <span className="text-4xl animate-bounce" style={{ animationDelay: '0.2s' }}>🚀</span>
-                    </div>
-                </div>
-            )}
-
-            {/* Enhanced Error Display */}
-            {voting.error && (
-                <div className="mt-6 glass-dark rounded-2xl p-4 border border-red-500/50">
-                    <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-3">
-                            <span className="text-red-400 text-xl">⚠️</span>
-                            <div>
-                                <p className="text-red-400 font-medium">{voting.error.error}</p>
-                                {voting.error.details && (
-                                    <p className="text-red-300 text-sm">{voting.error.details}</p>
-                                )}
-                            </div>
-                        </div>
-                        {voting.reconnect && (
-                            <button 
-                                onClick={voting.reconnect}
-                                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition-all duration-300 magnetic"
-                            >
-                                Reconnect
-                            </button>
-                        )}
-                    </div>
-                </div>
-            )}
-
-            {/* Voting Reminders Panel */}
-            {showReminders && !voting.allVotesComplete && voting.pendingCount > 0 && (
-                <div className="mt-6 glass-effect rounded-2xl p-4">
-                    <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-2">
-                            <span className="text-neon-yellow">🔔</span>
-                            <span className="text-sm text-neon-yellow">
-                                {voting.pendingCount} member{voting.pendingCount > 1 ? 's' : ''} still need to vote
-                            </span>
-                        </div>
-                        <button 
-                            onClick={() => voting.sendVotingReminder('gentle')}
-                            className="px-3 py-1 bg-neon-yellow/20 hover:bg-neon-yellow/30 text-neon-yellow rounded-lg text-xs font-medium transition-all duration-300 magnetic"
-                        >
-                            Send Reminder
-                        </button>
-                    </div>
-                </div>
-            )}
-        </div>
-    );
+        })
+    };
 };
 
 export default useLiveVoting;
