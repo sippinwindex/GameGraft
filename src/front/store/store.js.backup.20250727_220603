@@ -174,35 +174,6 @@ export const ACTION_TYPES = {
     TOGGLE_MEMBER_MODAL: 'toggle_member_modal',
     TOGGLE_VOTING_MODAL: 'toggle_voting_modal',
     SET_SELECTED_GAME: 'set_selected_game'
-
-    // Live voting actions - for useLiveVoting hook
-    START_VOTING_SESSION: 'START_VOTING_SESSION',
-    END_VOTING_SESSION: 'END_VOTING_SESSION',
-    USER_VOTED: 'USER_VOTED',
-    USER_PENDING: 'USER_PENDING',
-    SET_CURRENT_VOTER: 'SET_CURRENT_VOTER',
-    ALL_VOTES_COMPLETE: 'ALL_VOTES_COMPLETE',
-    UPDATE_VOTING_MEMBERS: 'UPDATE_VOTING_MEMBERS',
-    SET_VOTING_MEMBERS: 'SET_VOTING_MEMBERS',
-    VOTING_REMINDER_SENT: 'VOTING_REMINDER_SENT',
-    VOTING_TIME_WARNING: 'VOTING_TIME_WARNING',
-    SET_VOTING_ERROR: 'SET_VOTING_ERROR',
-    SET_VOTING_CONNECTION_STATUS: 'SET_VOTING_CONNECTION_STATUS',
-    RESET_VOTING_STATE: 'RESET_VOTING_STATE'
-
-    // Live voting actions - for useLiveVoting hook
-    END_VOTING_SESSION: 'END_VOTING_SESSION',
-    USER_VOTED: 'USER_VOTED',
-    USER_PENDING: 'USER_PENDING',
-    SET_CURRENT_VOTER: 'SET_CURRENT_VOTER',
-    ALL_VOTES_COMPLETE: 'ALL_VOTES_COMPLETE',
-    UPDATE_VOTING_MEMBERS: 'UPDATE_VOTING_MEMBERS',
-    SET_VOTING_MEMBERS: 'SET_VOTING_MEMBERS',
-    VOTING_REMINDER_SENT: 'VOTING_REMINDER_SENT',
-    VOTING_TIME_WARNING: 'VOTING_TIME_WARNING',
-    SET_VOTING_ERROR: 'SET_VOTING_ERROR',
-    SET_VOTING_CONNECTION_STATUS: 'SET_VOTING_CONNECTION_STATUS',
-    RESET_VOTING_STATE: 'RESET_VOTING_STATE'
 };
 
 // ENHANCED: More robust reducer with gaming state management
@@ -660,45 +631,6 @@ export const getGamingSelectors = (state) => ({
     getGroupError: () => state.gaming.groupError,
     
     // Voting selectors
-
-// 🚀 Enhanced selectors object for useLiveVoting hook
-export const selectors = {
-    // Live voting specific selectors
-    selectIsVotingActive: (state) => state.liveVoting?.isActive || false,
-    selectVotingSession: (state) => state.liveVoting?.sessionId || null,
-    selectVotingMembers: (state) => state.liveVoting?.members || [],
-    selectVotedUsers: (state) => state.liveVoting?.votedUsers || [],
-    selectPendingUsers: (state) => state.liveVoting?.pendingUsers || [],
-    selectCurrentVoter: (state) => state.liveVoting?.currentVoter || null,
-    selectAllVotesComplete: (state) => state.liveVoting?.allVotesComplete || false,
-    selectVotingProgress: (state) => {
-        const members = state.liveVoting?.members || [];
-        const voted = state.liveVoting?.votedUsers || [];
-        if (members.length === 0) return 0;
-        return Math.round((voted.length / members.length) * 100);
-    },
-    selectSessionStatus: (state) => state.liveVoting?.status || 'inactive',
-    selectVotingError: (state) => state.liveVoting?.error || null
-};
-
-// 🚀 Voting helpers for useLiveVoting hook
-export const votingHelpers = {
-    startVotingSession: (dispatch, sessionData) => {
-        dispatch({ type: ACTION_TYPES.START_VOTING_SESSION, payload: sessionData });
-    },
-    handleVoteUpdate: (dispatch, updateData) => {
-        const { userId, action } = updateData;
-        if (action === 'voted') {
-            dispatch({ type: ACTION_TYPES.USER_VOTED, payload: updateData });
-        } else if (action === 'pending') {
-            dispatch({ type: ACTION_TYPES.USER_PENDING, payload: updateData });
-        }
-    },
-    endVotingSession: (dispatch, endData = {}) => {
-        dispatch({ type: ACTION_TYPES.END_VOTING_SESSION, payload: endData });
-    }
-};
-
     getActiveSession: () => state.gaming.activeSession,
     getSessionResults: () => state.gaming.sessionResults,
     getSessionVoters: () => state.gaming.sessionVoters,
@@ -714,49 +646,6 @@ export const votingHelpers = {
     isMemberModalOpen: () => state.gaming.showMemberModal,
     isVotingModalOpen: () => state.gaming.showVotingModal,
     getSelectedGame: () => state.gaming.selectedGame,
-
-// 🚀 Enhanced selectors object for useLiveVoting hook
-                        timestamp: timestamp || new Date().toISOString()
-                    }
-                });
-                break;
-                
-            case 'pending':
-                dispatch({
-                    type: ACTION_TYPES.USER_PENDING,
-                    payload: {
-                        userId,
-                        reason: updateData.reason
-                    }
-                });
-                break;
-                
-            default:
-                console.warn('Unknown vote action:', action);
-        }
-    },
-
-    // End voting session
-    endVotingSession: (dispatch, endData = {}) => {
-        dispatch({
-            type: ACTION_TYPES.END_VOTING_SESSION,
-            payload: {
-                reason: endData.reason || 'manual',
-                endedBy: endData.endedBy,
-                endTime: new Date().toISOString()
-            }
-        });
-    },
-
-    // Reset voting state
-    resetVotingState: (dispatch) => {
-        dispatch({
-            type: ACTION_TYPES.RESET_VOTING_STATE,
-            payload: {}
-        });
-    }
-};
-
     
     // User role selectors
     isCurrentUserGroupCreator: () => {

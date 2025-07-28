@@ -1,54 +1,29 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
-  server: {
-    port: 3000,
-    host: '0.0.0.0', // This is crucial to allow external connections in Codespaces
-    
-    // This hmr block is the key to fixing the refresh loop
-    hmr: {
-      // Check if we're in Codespaces environment
-      ...(process.env.CODESPACE_NAME && process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN ? {
-        // These settings tell the Vite client in the browser how to connect to the server
-        protocol: 'wss', // Use secure web sockets
-        host: `${process.env.CODESPACE_NAME}-3000.${process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}`,
-        // The client port needs to be 443, the standard port for HTTPS/WSS traffic.
-        // GitHub's proxy will then route it internally to port 3000.
-        clientPort: 443
-      } : {
-        // Local development fallback
-        protocol: 'ws',
-        host: 'localhost'
-      })
-    }
-  },
-  
-  // Define environment variables that will be available in your React app
-  define: {
-    // Make these available to your frontend for API calls
-    __CODESPACE_NAME__: JSON.stringify(process.env.CODESPACE_NAME || null),
-    __GITHUB_CODESPACES_DOMAIN__: JSON.stringify(process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN || null),
-    __IS_CODESPACE__: JSON.stringify(!!process.env.CODESPACE_NAME),
-  },
-  
-  // Preview configuration for production builds in Codespaces
-  preview: {
-    port: 3000,
-    host: '0.0.0.0'
-  },
-  
-  // Build configuration
-  build: {
-    // Production optimizations - code splitting and chunk optimization
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom'],
-          router: ['react-router-dom'],
-          utils: ['gsap']
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: './src/test/setup.js',
+    css: true,
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'html', 'lcov'],
+      include: ['src/**/*.{js,jsx}'],
+      exclude: [
+        'src/**/*.test.{js,jsx}',
+        'src/**/*.spec.{js,jsx}',
+        'src/test/**',
+        'node_modules/**'
+      ],
+      thresholds: {
+        global: {
+          branches: 80,
+          functions: 80,
+          lines: 80,
+          statements: 80
         }
       }
     }
